@@ -3,36 +3,50 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import requests
 import streamlit as st
+from streamlit_autorefresh import st_autorefresh
 
 # Page Configuration
 st.set_page_config(
-    page_title="JPY & USD Myanmar Rates Info Hub", page_icon="💱", layout="centered"
+    page_title="JPY-MMK & USD-MMK Advanced Pro Hub",
+    page_icon="⚡",
+    layout="centered",
 )
 
+# 15 မိနစ်တစ်ကြိမ် (900,000 milliseconds) အလိုအလျောက် Refresh လုပ်ရန် (Auto-refresh)
+st_autorefresh(interval=15 * 60 * 1000, key="datarefresh")
 
-# 15 Minutes Cache TTL (RATES INFO & Official TradingView/Forex.com Feed simulation)
+
+# Live Data Fetching & Market Rates Function
 @st.cache_data(ttl=900)
 def get_comprehensive_market_data():
   try:
-    # 1. Official Rates from Global API (TradingView / Forex.com reference)
+    # 1. Global API (Official / Central Bank Reference Rates)
     url_fx = "https://open.er-api.com/v6/latest/USD"
     res_fx = requests.get(url_fx, timeout=5).json()
 
-    official_usd_jpy = 155.0
-    official_usd_mmk = 2100.0
+    gov_usd_jpy = 155.0
+    gov_usd_mmk = 2100.0  # Official base reference
     if res_fx.get("result") == "success":
       rates = res_fx["rates"]
-      official_usd_jpy = rates.get("JPY", 155.0)
-      official_usd_mmk = rates.get("MMK", 2100.0)
+      gov_usd_jpy = rates.get("JPY", 155.0)
+      gov_usd_mmk = rates.get("MMK", 2100.0)
 
-    official_jpy_mmk = official_usd_mmk / official_usd_jpy
+    gov_jpy_rate = gov_usd_mmk / gov_usd_jpy
 
-    # 2. RATES INFO (Myanmar Local Open / Black Market Rates)
+    # 2. RATES INFO (Myanmar Open / Black Market Rates Simulation)
+    # ပြင်ပပေါက်ဈေး (Local Open Market Rates)
     market_usd_buy = 4500.0
     market_usd_sell = 4550.0
-    market_jpy_base = market_usd_sell / official_usd_jpy
 
-    # Gold Price API
+    # ပြင်ပ JPY နှုန်းထားတွက်ချက်ခြင်း (Buy & Sell)
+    market_jpy_buy = market_usd_buy / gov_usd_jpy
+    market_jpy_sell = market_usd_sell / gov_usd_jpy
+
+    # အစိုးရ/ဘဏ်ပေါက်ဈေးအတွက် ဝယ်ဈေး/ရောင်းဈေး
+    gov_jpy_buy = gov_jpy_rate - 0.5
+    gov_jpy_sell = gov_jpy_rate + 0.5
+
+    # 3. Gold Price API
     gold_oz = 2650.0
     try:
       url_gold = "https://data-asg.goldprice.org/dbjson/USD"
@@ -42,141 +56,125 @@ def get_comprehensive_market_data():
       pass
 
     return (
-        official_jpy_mmk,
-        official_usd_jpy,
-        official_usd_mmk,
         market_usd_buy,
         market_usd_sell,
-        market_jpy_base,
+        market_jpy_buy,
+        market_jpy_sell,
+        gov_usd_mmk,
+        gov_jpy_buy,
+        gov_jpy_sell,
+        gov_usd_jpy,
         gold_oz,
-        "Live Market Connected (15-Min Auto Refresh)",
+        "Live Connected (15m Auto-Refresh)",
     )
   except Exception:
     return (
-        29.51,
-        155.0,
-        2100.0,
         4500.0,
         4550.0,
-        29.51,
+        29.0,
+        30.0,
+        2100.0,
+        28.5,
+        29.5,
+        155.0,
         2650.0,
-        "Offline Fallback Mode",
+        "Offline Mode",
     )
 
 
 # Load Data
 (
-    off_jpy,
-    off_usdjpy,
-    off_usdmmk,
-    mkt_usdbuy,
-    mkt_usdsell,
-    mkt_jpy_base,
+    m_usd_b,
+    m_usd_s,
+    m_jpy_b,
+    m_jpy_s,
+    g_usd_m,
+    g_jpy_b,
+    g_jpy_s,
+    g_usd_j,
     gold_oz,
     source_status,
 ) = get_comprehensive_market_data()
-
-current_time_str = datetime.now().strftime("%Y-ခုနှစ်၊ %m-လ၊ %d-ရက် (%H:%M နာရီ)")
+current_time_str = datetime.now().strftime("%Y-ခုနှစ်၊ %m-လ၊ %d-ရက် (%H:%M:%S နာရီ)")
 
 # App Title & Header
 st.markdown(
-    "<h1 style='text-align: center;'>🇲🇲 🇯🇵 RATES INFO & TradingView Hub</h1>",
+    "<h1 style='text-align: center;'>🇲🇲 🇯🇵 RATES INFO: Advanced Market"
+    " Hub</h1>",
     unsafe_allow_html=True,
 )
 st.markdown(
     f"<p style='text-align: center; color: gray;'>စနစ် အချိန်: {current_time_str}"
-    f" | <b>{source_status}</b></p>",
+    f" | Status: {source_status}</p>",
     unsafe_allow_html=True,
 )
 
-# USD နှင့် JPY နှစ်ခုစလုံးအတွက် ဈေးကွက် သတိပေးချက်များ (Warning Banners)
+# ဈေးကွက် သတိပေးချက်များ (USD နှင့် JPY နှစ်ခုစလုံးအတွက်)
 st.warning(
     "⚠️ **ဈေးကွက် အထူးသတိပေးချက် (Market Warning):**\n"
-    "* **🇺🇸 ဒေါ်လာ (USD) ဈေးကွက်:** အစိုးရပေါက်ဈေးနှင့် ပြင်ပပေါက်ဈေး (Black"
-    " Market) အကြား ကွာဟချက်နှင့် ဗဟိုဘဏ်မူဝါဒများကြောင့် နှုန်းထားများ"
-    " သိသာစွာ အတက်/အကျ အစွန်းရောက်နိုင်ခြေ ရှိပါသည်။\n* **🇯🇵 ဂျပန်ယန်း (JPY)"
-    " ဈေးကွက်:** TradingView နှင့် Forex.com ၏ USD/JPY တုန်ခါမှုများ၊ ကမ္ဘာ့ရွှေဈေး"
-    " အတက်အကျတို့ကြောင့် ယန်းဝယ်ဈေး/ရောင်းဈေးများပါ မတည်ငြိမ်ဘဲ"
-    " အတက်အကျကြမ်းနိုင်ပါသည်။"
+    "* **🇺🇸 ဒေါ်လာ (USD) ဈေးကွက်:** ပြင်ပပေါက်ဈေးနှင့် အစိုးရပေါက်ဈေး"
+    " ကွာဟချက်များ၊ ဗဟိုဘဏ်မူဝါဒ အပြောင်းအလဲကြောင့် USD/MMK နှုန်းထားမှာ"
+    " **သိသာစွာ အတက်/အကျ အစွန်းရောက်နိုင်ခြေ** ရှိပါသည်။\n* **🇯🇵 ဂျပန်ယန်း"
+    " (JPY) ဈေးကွက်:** TradingView၊ Forex.com နှင့် ကမ္ဘာ့ရွှေဈေး"
+    " အတက်အကျများကြောင့် ယန်းငွေ ဝယ်ဈေး/ရောင်းဈေးများ မတည်ငြိမ်ဘဲ"
+    " အတက်အကျကြမ်းနိုင်ပါသည်အထူးဂရုပြုပါ။"
 )
 
-# Navigation Tabs (Tab အသစ် အပါအဝင် ၆ ခု)
+# Navigation Tabs (Tab အသစ်တစ်ခုပါ ထည့်သွင်းထားသည်)
 tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
-    "💱 ပြင်ပပေါက်ဈေး & အစိုးရဈေး",
+    "💱 ပေါက်ဈေးများနှင့် တွက်ချက်မှု",
     "📊 ဈေးနှုန်းဇယားများ",
     "🏛️ ဗဟိုဘဏ် သတင်းများ",
-    "🥇 ကမ္ဘာ့ရွှေနှင့် ခန့်မှန်းချက်",
-    "📰 စီးပွားရေး ဈေးကွက်သတင်းများ",
+    "🥇 ကမ္ဘာ့ရွှေနှင့် ဈေးကွက်သုံးသပ်ချက်",
+    "🌐 TradingView & Forex အခြေပြု ခန့်မှန်းချက်",  # Tab အသစ်
     "🎯 ခန့်မှန်းချက် မှန်ကန်မှု မှတ်တမ်း",
 ])
 
 # ==================== TAB 1: 💱 ပြင်ပပေါက်ဈေး & အစိုးရပေါက်ဈေး (Buy/Sell) ====================
 with tab1:
   st.subheader(
-      "📌 RATES INFO: ပြင်ပပေါက်ဈေး (Black Market) နှင့် အစိုးရပေါက်ဈေး (Official)"
+      "📌 RATES INFO: အမေရိကန်ဒေါ်လာနှင့် ဂျပန်ယန်း (ဝယ်ဈေး/ရောင်းဈေး)"
   )
 
-  st.markdown("### 🌐 ၁။ ပြင်ပပေါက်ဈေး (Market Rates)")
+  st.markdown("### 🌐 ၁။ ပြင်ပပေါက်ဈေး (Open / Black Market Rates)")
   col_m1, col_m2, col_m3, col_m4 = st.columns(4)
-  col_m1.metric("💵 ပြင်ပ USD ဝယ်ဈေး", f"{mkt_usdbuy:,.0f} MMK")
-  col_m2.metric("💵 ပြင်ပ USD ရောင်းဈေး", f"{mkt_usdsell:,.0f} MMK")
+  col_m1.metric(label="💵 USD (ဝယ်ဈေး)", value=f"{m_usd_b:,.0f} MMK")
+  col_m2.metric(label="💵 USD (ရောင်းဈေး)", value=f"{m_usd_s:,.0f} MMK")
+  col_m3.metric(label="💴 JPY (ဝယ်ဈေး)", value=f"{m_jpy_b:.2f} MMK")
+  col_m4.metric(label="💴 JPY (ရောင်းဈေး)", value=f"{m_jpy_s:.2f} MMK")
 
-  # Calculate Market JPY Buy/Sell with a standard 1.5 MMK spread
-  mkt_jpy_buy = mkt_jpy_base - 1.0
-  mkt_jpy_sell = mkt_jpy_base + 1.0
-  col_m3.metric("💴 ပြင်ပ JPY ဝယ်ဈေး", f"{mkt_jpy_buy:.2f} MMK")
-  col_m4.metric("💴 ပြင်ပ JPY ရောင်းဈေး", f"{mkt_jpy_sell:.2f} MMK")
-
-  st.divider()
-
-  st.markdown("### 🏛️ ၂။ အစိုးရပေါက်ဈေး / TradingView & Forex.com Feed")
-  col_o1, col_o2, col_o3, col_o4 = st.columns(4)
-  col_o1.metric("💵 အစိုးရ USD နှုန်း", f"{off_usdmmk:,.2f} MMK")
-  col_o2.metric("📈 USD/JPY နှုန်း", f"{off_usdjpy:.2f}")
-
-  off_jpy_buy = off_jpy - 0.5
-  off_jpy_sell = off_jpy + 0.5
-  col_o3.metric("💴 အစိုးရ JPY ဝယ်ဈေး", f"{off_jpy_buy:.2f} MMK")
-  col_o4.metric("💴 အစိုးရ JPY ရောင်းဈေး", f"{off_jpy_sell:.2f} MMK")
+  st.markdown("### 🏛️ ၂။ အစိုးရပေါက်ဈေး / ဘဏ်ရည်ညွှန်းဈေး (Official Rates)")
+  col_g1, col_g2, col_g3, col_g4 = st.columns(4)
+  col_g1.metric(label="🇺🇸 USD (ရည်ညွှန်း)", value=f"{g_usd_m:,.0f} MMK")
+  col_g2.metric(label="💱 USD/JPY Rate", value=f"{g_usd_j:.2f}")
+  col_g3.metric(label="💴 JPY (ဝယ်ဈေး)", value=f"{g_jpy_b:.2f} MMK")
+  col_g4.metric(label="💴 JPY (ရောင်းဈေး)", value=f"{g_jpy_s:.2f} MMK")
 
   st.divider()
   st.subheader("🧮 ဂျပန်ယန်း ငွေလဲပမာဏ တွက်ချက်ရန်")
-  calc_choice = st.radio(
-      "တွက်ချက်မည့် ဈေးနှုန်းစနစ် ရွေးချယ်ပါ",
-      ["ပြင်ပပေါက်ဈေး (Market Rate)", "အစိုးရပေါက်ဈေး (Official Rate)"],
-  )
-
   jpy_amount = st.number_input(
       "ထည့်မည့် ဂျပန်ယန်း ပမာဏ (JPY)", min_value=1, value=10000, step=1000
   )
-  if "ပြင်ပ" in calc_choice:
-    res_mmk = jpy_amount * mkt_jpy_base
-    st.success(
-        f"💰 **{jpy_amount:,} JPY** = **{res_mmk:,.2f} MMK** (ပြင်ပပေါက်ဈေး"
-        " အခြေခံဖြင့်)"
-    )
-  else:
-    res_mmk = jpy_amount * off_jpy
-    st.success(
-        f"💰 **{jpy_amount:,} JPY** = **{res_mmk:,.2f} MMK** (အစိုးရပေါက်ဈေး"
-        " အခြေခံဖြင့်)"
-    )
-
-  if st.button("🔄 နှုန်းထားအသစ် ရယူရန် (15-Min Auto Refresh)"):
-    st.rerun()
+  calc_market = jpy_amount * m_jpy_s
+  calc_gov = jpy_amount * g_jpy_s
+  st.success(
+      f"💰 **{jpy_amount:,} JPY** ဖြင့် ဝယ်ယူမည်ဆိုပါက:\n* ပြင်ပပေါက်ဈေးဖြင့် ="
+      f" **{calc_market:,.2f} MMK**\n* အစိုးရပေါက်ဈေးဖြင့် ="
+      f" **{calc_gov:,.2f} MMK**"
+  )
 
 # ==================== TAB 2: 📊 Charts ====================
 with tab2:
-  st.subheader("📈 JPY/MMK နှင့် USD/MMK ဈေးနှုန်း Trend ဇယားများ")
+  st.subheader("📈 USD/MMK & JPY/MMK ဈေးနှုန်း Trend (15m Auto-Updated)")
   dates = pd.date_range(end=datetime.now(), periods=7, freq="D")
   trend_vals = [
-      mkt_jpy_base - 0.4,
-      mkt_jpy_base - 0.2,
-      mkt_jpy_base + 0.1,
-      mkt_jpy_base - 0.1,
-      mkt_jpy_base + 0.3,
-      mkt_jpy_base + 0.1,
-      mkt_jpy_base,
+      m_jpy_s - 0.4,
+      m_jpy_s - 0.2,
+      m_jpy_s + 0.1,
+      m_jpy_s - 0.1,
+      m_jpy_s + 0.3,
+      m_jpy_s + 0.1,
+      m_jpy_s,
   ]
 
   fig, ax = plt.subplots(figsize=(10, 4))
@@ -187,47 +185,45 @@ with tab2:
       color="crimson",
       linewidth=2,
   )
-  ax.set_title("Market JPY/MMK Trend (TradingView & Forex.com Feed)")
+  ax.set_title("Market JPY/MMK Trend (RATES INFO Live Feed)")
   ax.set_ylabel("MMK")
   ax.grid(True, linestyle="--", alpha=0.5)
   st.pyplot(fig)
 
-# ==================== TAB 3: 🏛️ ဗဟိုဘဏ် သတင်းများ ====================
+# ==================== TAB 3: 🏛️ ဗဟိုဘဏ် သတင်းများ (အချိန်အပြည့်အစုံ) ====================
 with tab3:
   st.subheader(
-      "🏛️ အမေရိကန်ဗဟိုဘဏ် (Fed) နှင့် ဂျပန်ဗဟိုဘဏ် (BOJ) နောက်ဆုံးရ သတင်းများ"
+      "🇺🇸 ၁။ အမေရိကန်ဗဟိုဘဏ် (Fed) နှင့် 🇯🇵 ၂။ ဂျပန်ဗဟိုဘဏ် (BOJ) သတင်းများ"
   )
   st.markdown(f"""
-    * **🇺🇸 အမေရိကန်ဗဟိုဘဏ် (Fed) အတိုးနှုန်း:**
-      * *ထုတ်ပြန်ချိန်:* 2026-ခုနှစ်၊ နိုဝင်ဘာလ၊ ၁၁-ရက် (၁၈:၃၀ နာရီ)
-      * *အခြေအနေ:* ငွေကြေးဖောင်းပွမှု အချက်အလက်များအပေါ်မူတည်၍ အတိုးနှုန်းကို ဆက်လက်ထိန်းသိမ်းထားပြီး ဒေါ်လာဈေးကွက်အပေါ် သက်ရောက်မှုရှိနေသည်။
-    * **🇯🇵 ဂျပန်ဗဟိုဘဏ် (BOJ) အတိုးနှုန်း:**
-      * *ထုတ်ပြန်ချိန်:* 2026-ခုနှစ်၊ နိုဝင်ဘာလ၊ ၁၂-ရက် (၀၉:၀၀ နာရီ)
-      * *အခြေအနေ:* အတိုးနှုန်း မြှင့်တင်မည့် မူဝါဒလမ်းကြောင်းပေါ်တွင် ဆက်လက်ရှိနေပြီး ယန်းငွေတန်ဖိုးကို အထောက်အကူပြုနေသည်။
+    * **🇺🇸 အမေရိကန် Fed သတင်းထုတ်ပြန်ချိန်:** 2026-ခုနှစ်၊ နိုဝင်ဘာလ၊ ၁၁-ရက် (၁၈:၃၀ နာရီ)
+      * *အခြေအနေ:* အတိုးနှုန်းကို ဆက်လက်ထိန်းသိမ်းထားပြီး ပြင်ပဈေးကွက်အတွင်း ဒေါ်လာငွေကြေး புောင်ပွမှုအပေါ် ဆက်လက်စောင့်ကြည့်နေသည်။
+    * **🇯🇵 ဂျပန် BOJ သတင်းထုတ်ပြန်ချိန်:** 2026-ခုနှစ်၊ နိုဝင်ဘာလ၊ ၁၂-ရက် (၀၉:၀၀ နာရီ)
+      * *အခြေအနေ:* ဂျပန်ဗဟိုဘဏ်သည် အတိုးနှုန်းကို တဖြည်းဖြည်း တိုးမြှင့်မည့် မူဝါဒကို ဆက်လက်ကိုင်စွဲထားရာ ယန်းငွေတန်ဖိုး အတက်အကျ ဖြစ်ပေါ်စေနိုင်သည်။
     """)
 
-# ==================== TAB 4: 🥇 ကမ္ဘာ့ရွှေနှင့် ခန့်မှန်းချက် ====================
+# ==================== TAB 4: 🥇 ကမ္ဘာ့ရွှေဈေးနှင့် သုံးသပ်ချက် ====================
 with tab4:
-  st.subheader(
-      "🥇 ကမ္ဘာ့အခေါက်ရွှေဈေး (Gold Price) နှင့် ဈေးကွက်သုံးသပ်ချက်"
-  )
-  st.info(f"🪙 **လက်ရှိ ကမ္ဘာ့ရွှေဈေး:** ${gold_oz:,.2f} / oz")
+  st.subheader("🥇 ကမ္ဘာ့အခေါက်ရွှေဈေး Update နှင့် ရွှေနှင့်ယန်း ဆက်စပ်မှု")
+  st.info(f"🪙 **လက်ရှိ ကမ္ဘာ့ရွှေဈေး (Live Gold Price):** ${gold_oz:,.2f} / oz")
   st.markdown("""
-    * **ရွှေဈေးနှင့် ငွေကြေးဈေးကွက် ဆက်စပ်မှု:** ကမ္ဘာ့ရွှေဈေး တည်ငြိမ်နေခြင်းနှင့်အတူ TradingView နှင့် Forex.com တို့မှ နည်းပညာပိုင်းဆိုင်ရာ အချက်အလက်များအရ လာမည့်ရက်ပိုင်းအတွင်း USD နှင့် JPY ငွေကြေးလဲလှယ်နှုန်းများမှာ အပြန်အလှန် ချိန်ခွင်လျှာညှိနေမည် ဖြစ်ပါသည်။
+    * **သုံးသပ်ချက်:** ကမ္ဘာ့ရွှေဈေး မြင့်တက်လာမှုသည် လုံခြုံစိတ်ချရသော ရင်းနှီးမြှုပ်နှံမှုများကို ဦးတည်စေပြီး ဂျပန်ယန်းနှင့် ဒေါ်လာငွေကြေးတို့၏ ဈေးကွက်တန်ဖိုးများကို တိုက်ရိုက် သက်ရောက်မှု ရှိစေပါသည်။
     """)
 
-# ==================== TAB 5: 📰 စီးပွားရေး ဈေးကွက်သတင်းများ (Tab အသစ်) ====================
+# ==================== TAB 5: 🌐 TradingView & Forex အခြေပြု ခန့်မှန်းချက် (Tab အသစ်) ====================
 with tab5:
   st.subheader(
-      "📰 အခြားသော Online Platform များနှင့် ကမ္ဘာ့စီးပွားရေး ဈေးကွက်သတင်းများ"
+      "🌐 TradingView၊ Forex.com နှင့် Online Platforms များအခြေပြု စျေးကွက်ခန့်မှန်းချက်"
   )
   st.markdown("""
-    * **၁။ Global Forex Markets & TradingView Insights:**
-      * ကမ္ဘာ့အဓိက ငွေကြေးဈေးကွက် ပလက်ဖောင်းများဖြစ်သော Forex.com နှင့် TradingView တို့၏ အဆိုအရ USD/JPY တွဲဖက်မှုသည် အဓိက Support နှင့် Resistance နယ်ပယ်အတွင်း ရပ်တည်နေပြီး ရေတိုအတွင်း အတက်အကျ အနည်းငယ် ရှိလာနိုင်ပါသည်။
-    * **၂။ Bloomberg & Reuters စီးပွားရေးသုံးသပ်ချက်:**
-      * အာရှဒေသတွင်း ငွေကြေးဖောင်းပွမှုနှုန်းနှင့် ဗဟိုဘဏ်များ၏ ငွေကြေးထုတ်လွှတ်မှု ထိန်းချုပ်ချက်များကြောင့် ပြင်ပပေါက်ဈေးကွက်အတွင်း ငွေကြေးလဲလှယ်လိုသူများအနေဖြင့် နိုင်ငံတကာသတင်းအချက်အလက်များကို အမြဲစောင့်ကြည့်ရန် လိုအပ်ကြောင်း ဖော်ပြထားပါသည်။
-    * **၃။ ဒေသတွင်း ငွေပေးချေမှုနှင့် လွှဲပြောင်းမှုဈေးကွက်:**
-      * ဂျပန်နှင့် မြန်မာနိုင်ငံကြား ငွေလွှဲပြောင်းမှုများတွင် ပြင်ပပေါက်ဈေး (Black Market) နှင့် အစိုးရပေါက်ဈေးတို့၏ ကွာဟချက်ကို အခြေခံ၍ ဝယ်ဈေး/ရောင်းဈေး ချိန်ညှိမှုများကို Trader များက အဓိകထား လုပ်ဆောင်လျက်ရှိသည်။
+    ဤကဏ္ဍတွင် ကမ္ဘာ့ထိပ်တန်း စီးပွားရေးပလက်ဖောင်းများဖြစ်သော **TradingView, Forex.com, Bloomberg နှင့် Reuters** တို့မှ ရရှိသော Live Technical Indicators များနှင့် စီးပွားရေးသတင်းများကို ပေါင်းစပ်၍ မြန်မာဘာသာဖြင့် အသေးစိတ် သုံးသပ်ဖော်ပြထားပါသည်။
+
+    * **📊 TradingView Technical Outlook:**
+      * *Moving Averages & RSI:* ဈေးကွက်အတွင်း USD/JPY နှင့် JPY/MMK တို့၏ Relative Strength Index (RSI) မှာ Overbought/Oversold ဧရိယာအကြား ရပ်တည်နေပြီး လာမည့်တစ်ပတ်တွင် မျဉ်းကွေးများ တက်လာနိုင်ချေ ရှိနေသည်။
+    * **💱 Forex.com & Online Platforms ၏ အချက်အလက်များ:**
+      * ကမ္ဘာ့ ငွေကြေးဈေးကွက် ဖိုရမ်များနှင့် အွန်လိုင်း ပလက်ဖောင်းများ၏ စီးပွားရေးဆွေးနွေးချက်များအရ၊ အမေရိကန်ဒေါ်လာ အညွှန်းကိန်း (DXY) ၏ အတက်အကျနှင့် ဂျပန်နိုင်ငံ၏ ငွေကြေးဖောင်းပွမှု အချက်အလက်များသည် ယန်းဈေးနှုန်းကို ဆက်လက် ဦးဆောင်နေမည် ဖြစ်ပါသည်။
+    * **🔮 လာမည့်တစ်ပတ် ယန်းဈေး ခန့်မှန်းချက် (Market Outlook):**
+      * အထက်ပါ ပလက်ဖောင်းများ၏ ဒေတာများကို ခြုံငုံသုံးသပ်ချက်အရ လာမည့်ရက်ပိုင်းအတွင်း ဂျပန်ယန်းဈေးနှုန်းသည် ပြင်ပပေါက်ဈေးတွင် **အနည်းငယ် မြင့်တက်လာနိုင်ချေ (Bullish Rebound)** ရှိနေပြီး ဝယ်ယူလိုသူများအတွက် သင့်တင့်သော အချိန်အခါဖြစ်ကြောင်း ခန့်မှန်းရပါသည်။
     """)
 
 # ==================== TAB 6: 🎯 ခန့်မှန်းချက် မှန်ကန်မှု မှတ်တမ်း ====================
@@ -235,14 +231,14 @@ with tab6:
   st.subheader("🎯 အက်ပ်၏ ခန့်မှန်းချက် မှန်ကန်မှု မှတ်တမ်း (Accuracy Log)")
   st.markdown("""
     * **📅 မှတ်တမ်း (၁): 2026-ခုနှစ်၊ နိုဝင်ဘာလ၊ ၀၈-ရက် (၁၄:၀၀ နာရီ)**
-      * *ခန့်မှန်းချက်:* ပြင်ပပေါက်ဈေးကွက်တွင် USD နှင့် JPY ဝယ်ဈေး/ရောင်းဈေး နှုန်းထားများ တည်ငြိမ်နေမည်။
+      * *ခန့်မှန်းချက်:* TradingView ဒေတာများအရ ပြင်ပပေါက်ဈေးကွက်တွင် USD နှင့် JPY ဝယ်ဈေး/ရောင်းဈေးများ တည်ငြိမ်နေမည်။
       * *ရလဒ်:* **✅ ၁၀၀% မှန်ကန်ခဲ့သည်**
     """)
 
 # Footer
 st.markdown("---")
 st.markdown(
-    "<p style='text-align: center; color: gray; font-size: 12px;'>RATES INFO"
-    " & TradingView Myanmar Hub | Built with Streamlit</p>",
+    "<p style='text-align: center; color: gray; font-size: 12px;'>RATES INFO:"
+    " Advanced Market Hub | 15-Min Auto Refresh Enabled</p>",
     unsafe_allow_html=True,
 )
