@@ -1,244 +1,1668 @@
-from datetime import datetime
-import matplotlib.pyplot as plt
+from __future__ import annotations
+
+"""Professional Football Prediction Dashboard V8.5 Providers: - football-data.org v4: fixtures, recent finished results, standings - The Odds API v4: multi-region h2h and totals odds (on-demand per match; auto on Top 10) - Live Football API v1: match injuries, lineups, and available match statistics (on-demand) Model: - chronological Elo ratings - league-relative venue-specific attack/defence goal-rate xG proxy (attacking power = 0.75) - Dixon-Coles-adjusted Poisson score matrix + Top 2 & Top 3 exact scores + Goal Difference probabilities - short-rest, injuries, lineup status, manual tactical/motivation, and optional odds blend """
+
+import json
+import math
+import os
+import re
+import sqlite3
+import time
+import unicodedata
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+from zoneinfo import ZoneInfo
+
+import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
-from streamlit_autorefresh import st_autorefresh
 
-# Page Configuration
 st.set_page_config(
-    page_title="JPY-MMK & USD-MMK Advanced Pro Hub",
-    page_icon="⚡",
-    layout="centered",
+    page_title="Football Prediction Dashboard V8.5",
+    page_icon="⚽",
+    layout="wide",
+    initial_sidebar_state="expanded",
 )
 
-# 15 မိနစ်တစ်ကြိမ် (900,000 milliseconds) အလိုအလျောက် Refresh လုပ်ရန် (Auto-refresh)
-st_autorefresh(interval=15 * 60 * 1000, key="datarefresh")
+UTC = timezone.utc
+LOCAL_TZ = ZoneInfo("Asia/Yangon")
+FOOTBALL_DATA_BASE = "https://api.football-data.org/v4"
+ODDS_API_BASE = "https://api.the-odds-api.com/v4"
+LIVE_FOOTBALL_API_BASES = [
+    "https://live-football-api.com/api/v1",
+]
+REQUEST_TIMEOUT = 30
+MODEL_VERSION = "elo-dixon-coles-v8.5"
+DIXON_COLES_RHO = -0.04
+HOME_ELO_ADVANTAGE = 55.0
+DEFAULT_ATTACK_POWER = 0.75
+MAX_GOALS = 8
+HISTORY_DB_PATH = os.environ.get("PREDICTION_HISTORY_DB", "football_prediction_history.sqlite3")
+HISTORY_CALIBRATION_MIN_SAMPLES = 100
+
+TEAM_ALIASES: Dict[str, str] = {
+    "1fckoln": "koln",
+    "fckoln": "koln",
+    "koln": "koln",
+    "cologne": "koln",
+    "fccologne": "koln",
+    "1fccologne": "koln",
+    "fcbayernmunchen": "bayernmunich",
+    "bayernmunchen": "bayernmunich",
+    "fcbayernmunich": "bayernmunich",
+    "bayernmunich": "bayernmunich",
+    "bayern": "bayernmunich",
+    "borussiamonchengladbach": "monchengladbach",
+    "monchengladbach": "monchengladbach",
+    "gladbach": "monchengladbach",
+    "bvb": "borussiadortmund",
+    "borussiadortmund": "borussiadortmund",
+    "rbleipzig": "leipzig",
+    "rasenballsportleipzig": "leipzig",
+    "leipzig": "leipzig",
+    "bayer04leverkusen": "bayerleverkusen",
+    "bayerleverkusen": "bayerleverkusen",
+    "tsg1899hoffenheim": "hoffenheim",
+    "tsghoffenheim": "hoffenheim",
+    "hoffenheim": "hoffenheim",
+    "vfbstuttgart": "stuttgart",
+    "stuttgart": "stuttgart",
+    "vflwolfsburg": "wolfsburg",
+    "wolfsburg": "wolfsburg",
+    "svwerderbremen": "werderbremen",
+    "werderbremen": "werderbremen",
+    "1fsvmainz05": "mainz05",
+    "mainz05": "mainz05",
+    "mainz": "mainz05",
+    "fcaugsburg": "augsburg",
+    "augsburg": "augsburg",
+    "1fcunionberlin": "unionberlin",
+    "unionberlin": "unionberlin",
+    "fcschalke04": "schalke04",
+    "schalke04": "schalke04",
+    "schalke": "schalke04",
+    "hamburgersv": "hamburg",
+    "hamburger": "hamburg",
+    "hamburg": "hamburg",
+    "manchestercity": "mancity",
+    "mancity": "mancity",
+    "manchesterunited": "manutd",
+    "manutd": "manutd",
+    "tottenhamhotspur": "tottenham",
+    "spurs": "tottenham",
+    "tottenham": "tottenham",
+    "wolverhamptonwanderers": "wolves",
+    "wolves": "wolves",
+    "brightonandhovealbion": "brighton",
+    "brighton": "brighton",
+    "westhamunited": "westham",
+    "westham": "westham",
+    "newcastleunited": "newcastle",
+    "newcastle": "newcastle",
+    "nottinghamforest": "nottinghamforest",
+    "nottmforest": "nottinghamforest",
+    "leicestercity": "leicester",
+    "leicester": "leicester",
+    "intermilan": "inter",
+    "internazionale": "inter",
+    "inter": "inter",
+    "acmilan": "milan",
+    "milan": "milan",
+    "asroma": "roma",
+    "roma": "roma",
+    "sscnapoli": "napoli",
+    "napoli": "napoli",
+    "atleticomadrid": "atleticomadrid",
+    "atleticodemadrid": "atleticomadrid",
+    "athleticbilbao": "athleticclub",
+    "athleticclub": "athleticclub",
+    "realbetis": "betis",
+    "betis": "betis",
+    "realsociedad": "sociedad",
+    "sociedad": "sociedad",
+    "parissaintgermain": "psg",
+    "psg": "psg",
+    "olympiquelyonnais": "lyon",
+    "olympiquelyon": "lyon",
+    "lyon": "lyon",
+    "olympiquedemarseille": "marseille",
+    "marseille": "marseille",
+    "asmonaco": "monaco",
+    "monaco": "monaco",
+}
+
+LEAGUES: Dict[str, Dict[str, Any]] = {
+    "England Premier League": {"football_data": "PL", "odds": "soccer_epl", "lfa_league": "lfa-premier-league"},
+    "Spain LaLiga": {"football_data": "PD", "odds": "soccer_spain_la_liga", "lfa_league": "lfa-la-liga"},
+    "Germany Bundesliga": {"football_data": "BL1", "odds": "soccer_germany_bundesliga", "lfa_league": "lfa-bundesliga"},
+    "Italy Serie A": {"football_data": "SA", "odds": "soccer_italy_serie_a", "lfa_league": "lfa-serie-a"},
+    "France Ligue 1": {"football_data": "FL1", "odds": "soccer_france_ligue_one", "lfa_league": "lfa-ligue-1"},
+    "UEFA Champions League": {"football_data": "CL", "odds": "soccer_uefa_champs_league", "lfa_league": "lfa-champions-league"},
+    "UEFA Europa League": {"football_data": "EL", "odds": "soccer_uefa_europa_league", "lfa_league": "lfa-europa-league"},
+}
 
 
-# Live Data Fetching & Market Rates Function
-@st.cache_data(ttl=900)
-def get_comprehensive_market_data():
-  try:
-    # 1. Global API (Official / Central Bank Reference Rates)
-    url_fx = "https://open.er-api.com/v6/latest/USD"
-    res_fx = requests.get(url_fx, timeout=5).json()
+# -----------------------------
+# Generic helpers
+# -----------------------------
 
-    gov_usd_jpy = 155.0
-    gov_usd_mmk = 2100.0  # Official base reference
-    if res_fx.get("result") == "success":
-      rates = res_fx["rates"]
-      gov_usd_jpy = rates.get("JPY", 155.0)
-      gov_usd_mmk = rates.get("MMK", 2100.0)
 
-    gov_jpy_rate = gov_usd_mmk / gov_usd_jpy
-
-    # 2. RATES INFO (Myanmar Open / Black Market Rates Simulation)
-    # ပြင်ပပေါက်ဈေး (Local Open Market Rates)
-    market_usd_buy = 4500.0
-    market_usd_sell = 4550.0
-
-    # ပြင်ပ JPY နှုန်းထားတွက်ချက်ခြင်း (Buy & Sell)
-    market_jpy_buy = market_usd_buy / gov_usd_jpy
-    market_jpy_sell = market_usd_sell / gov_usd_jpy
-
-    # အစိုးရ/ဘဏ်ပေါက်ဈေးအတွက် ဝယ်ဈေး/ရောင်းဈေး
-    gov_jpy_buy = gov_jpy_rate - 0.5
-    gov_jpy_sell = gov_jpy_rate + 0.5
-
-    # 3. Gold Price API
-    gold_oz = 2650.0
+def safe_secret(name: str, default: str = "") -> str:
     try:
-      url_gold = "https://data-asg.goldprice.org/dbjson/USD"
-      res_gold = requests.get(url_gold, timeout=3).json()
-      gold_oz = res_gold["items"][0]["xauPrice"]
+        value = st.secrets.get(name, default)
     except Exception:
-      pass
+        value = default
+    return str(value or "")
 
-    return (
-        market_usd_buy,
-        market_usd_sell,
-        market_jpy_buy,
-        market_jpy_sell,
-        gov_usd_mmk,
-        gov_jpy_buy,
-        gov_jpy_sell,
-        gov_usd_jpy,
-        gold_oz,
-        "Live Connected (15m Auto-Refresh)",
+
+def utc_now() -> datetime:
+    return datetime.now(UTC)
+
+
+def parse_datetime(value: Any) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+        return parsed.astimezone(UTC)
+    except (TypeError, ValueError):
+        return None
+
+
+def local_datetime(value: Any) -> str:
+    parsed = parse_datetime(value)
+    return parsed.astimezone(LOCAL_TZ).strftime("%Y-%m-%d %H:%M MMT") if parsed else "—"
+
+
+def normalize_team(name: Any) -> str:
+    text = unicodedata.normalize("NFKD", str(name or "").lower())
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    text = re.sub(r"\b(fc|afc|cf|ssc|sc|club|1\.|04|05)\b", " ", text)
+    cleaned = re.sub(r"[^a-z0-9]", "", text)
+    return TEAM_ALIASES.get(cleaned, cleaned)
+
+
+def same_team(left: Any, right: Any) -> bool:
+    a, b = normalize_team(left), normalize_team(right)
+    return bool(a and b and (a == b or (len(a) > 5 and a in b) or (len(b) > 5 and b in a)))
+
+
+def clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+
+def safe_float(value: Any) -> Optional[float]:
+    try:
+        if value is None or str(value).strip() == "":
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def error_message(response: requests.Response) -> str:
+    messages = {
+        401: "API key is invalid or missing.",
+        403: "API key does not have permission for this resource.",
+        404: "API endpoint or competition was not found.",
+        429: "Provider rate limit or quota reached. Wait or check your plan.",
+    }
+    try:
+        detail = response.json()
+        if isinstance(detail, dict):
+            detail = detail.get("message") or detail.get("errors") or detail.get("error")
+        else:
+            detail = None
+    except ValueError:
+        detail = None
+    base = messages.get(response.status_code, f"HTTP {response.status_code}")
+    return f"{base} {detail}" if detail else base
+
+
+def http_json( url: str, *, headers: Optional[Dict[str, str]] = None, params: Optional[Dict[str, Any]] = None, ) -> Tuple[Optional[Any], Optional[str], Dict[str, str]]:
+    try:
+        response = requests.get(url, headers=headers, params=params, timeout=REQUEST_TIMEOUT)
+        response_headers = {k.lower(): v for k, v in response.headers.items()}
+        if response.status_code != 200:
+            return None, error_message(response), response_headers
+        return response.json(), None, response_headers
+    except requests.Timeout:
+        return None, "API request timed out.", {}
+    except (requests.RequestException, ValueError) as exc:
+        return None, f"API/network error: {exc}", {}
+
+
+# -----------------------------
+# Provider 1: football-data.org v4
+# -----------------------------
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_fixtures(competition_code: str, api_key: str, date_from: str, date_to: str) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    if not api_key:
+        return [], "Football-data.org API key is not configured."
+    payload, error, _ = http_json(
+        f"{FOOTBALL_DATA_BASE}/competitions/{competition_code}/matches",
+        headers={"X-Auth-Token": api_key},
+        params={"dateFrom": date_from, "dateTo": date_to},
     )
-  except Exception:
-    return (
-        4500.0,
-        4550.0,
-        29.0,
-        30.0,
-        2100.0,
-        28.5,
-        29.5,
-        155.0,
-        2650.0,
-        "Offline Mode",
+    if error:
+        return [], error
+    return (payload or {}).get("matches", []), None
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_finished_matches(competition_code: str, api_key: str, date_from: str, date_to: str) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    if not api_key:
+        return [], "Football-data.org API key is not configured."
+    payload, error, _ = http_json(
+        f"{FOOTBALL_DATA_BASE}/competitions/{competition_code}/matches",
+        headers={"X-Auth-Token": api_key},
+        params={"dateFrom": date_from, "dateTo": date_to, "status": "FINISHED"},
+    )
+    if error:
+        return [], error
+    matches = (payload or {}).get("matches", [])
+    return [m for m in matches if m.get("status") == "FINISHED"], None
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_standings(competition_code: str, api_key: str) -> Tuple[Dict[str, Dict[str, Any]], Optional[str]]:
+    if not api_key:
+        return {}, "Football-data.org API key is not configured."
+    payload, error, _ = http_json(
+        f"{FOOTBALL_DATA_BASE}/competitions/{competition_code}/standings",
+        headers={"X-Auth-Token": api_key},
+    )
+    if error:
+        return {}, error
+    standings: Dict[str, Dict[str, Any]] = {}
+    for block in (payload or {}).get("standings", []):
+        if block.get("type") != "TOTAL":
+            continue
+        for row in block.get("table", []):
+            name = row.get("team", {}).get("name")
+            if name:
+                standings[normalize_team(name)] = {
+                    "name": name,
+                    "position": row.get("position", 0),
+                    "points": row.get("points", 0),
+                    "played": row.get("playedGames", 0),
+                    "goal_difference": row.get("goalDifference", 0),
+                    "goals_for": row.get("goalsFor", 0),
+                    "goals_against": row.get("goalsAgainst", 0),
+                }
+    return standings, None
+
+
+def fixture_window(days_ahead: int = 7) -> Tuple[str, str, datetime, datetime]:
+    now = utc_now()
+    start = now - timedelta(hours=12)
+    end = now + timedelta(days=days_ahead)
+    return start.date().isoformat(), (end.date() + timedelta(days=1)).isoformat(), start, end
+
+
+def finished_window(days_back: int = 210) -> Tuple[str, str]:
+    today = utc_now().date()
+    return (today - timedelta(days=days_back)).isoformat(), (today + timedelta(days=1)).isoformat()
+
+
+def upcoming_only(matches: Iterable[Dict[str, Any]], start: datetime, end: datetime) -> List[Dict[str, Any]]:
+    found = []
+    for match in matches:
+        kickoff = parse_datetime(match.get("utcDate"))
+        if kickoff and start <= kickoff <= end and match.get("status") in {"SCHEDULED", "TIMED"}:
+            found.append(match)
+    return sorted(found, key=lambda m: m.get("utcDate", ""))
+
+
+# -----------------------------
+# Provider 2: The Odds API v4
+# -----------------------------
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_global_odds(sport_key: str, api_key: str, regions: str) -> Tuple[List[Dict[str, Any]], Optional[str], Optional[str]]:
+    if not api_key:
+        return [], "The Odds API key is not configured.", None
+    base_params = {
+        "regions": regions,
+        "markets": "h2h,totals",
+        "oddsFormat": "decimal",
+        "dateFormat": "iso",
+    }
+    payload, error, response_headers = http_json(
+        f"{ODDS_API_BASE}/sports/{sport_key}/odds",
+        headers={"x-api-key": api_key},
+        params=base_params,
+    )
+    if error and ("401" in error or "403" in error or "invalid" in error.lower()):
+        query_params = dict(base_params)
+        query_params["apiKey"] = api_key
+        payload2, error2, response_headers2 = http_json(
+            f"{ODDS_API_BASE}/sports/{sport_key}/odds",
+            params=query_params,
+        )
+        if not error2:
+            payload, error, response_headers = payload2, error2, response_headers2
+
+    remaining = response_headers.get("x-requests-remaining")
+    if error:
+        return [], error, remaining
+    return (payload if isinstance(payload, list) else []), None, remaining
+
+
+def match_odds_event(home: str, away: str, odds_events: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    for event in odds_events:
+        if same_team(home, event.get("home_team")) and same_team(away, event.get("away_team")):
+            return event
+    return None
+
+
+def _outcome_side(name: str, home: str, away: str) -> Optional[str]:
+    value = str(name or "").strip().lower()
+    if value in {"draw", "tie"}:
+        return "draw"
+    if same_team(name, home):
+        return "home"
+    if same_team(name, away):
+        return "away"
+    return None
+
+
+def parse_global_odds(event: Optional[Dict[str, Any]], home: str, away: str) -> Dict[str, Any]:
+    result: Dict[str, Any] = {
+        "h2h_best": {},
+        "h2h_market_probability": {},
+        "totals25_best": {},
+        "totals25_market_probability": {},
+        "bookmakers": 0,
+        "last_update": None,
+    }
+    if not event:
+        return result
+    h2h_by_book: List[Dict[str, float]] = []
+    totals_by_book: List[Dict[str, float]] = []
+    for bookmaker in event.get("bookmakers", []):
+        book_h2h: Dict[str, float] = {}
+        book_total: Dict[str, float] = {}
+        result["last_update"] = bookmaker.get("last_update") or result["last_update"]
+        for market in bookmaker.get("markets", []):
+            key = str(market.get("key", "")).lower()
+            outcomes = market.get("outcomes", [])
+            if key == "h2h":
+                for outcome in outcomes:
+                    side = _outcome_side(outcome.get("name"), home, away)
+                    price = safe_float(outcome.get("price"))
+                    if side and price and price > 1:
+                        result["h2h_best"][side] = max(result["h2h_best"].get(side, 0), price)
+                        book_h2h[side] = 1.0 / price
+            elif key == "totals":
+                for outcome in outcomes:
+                    point = safe_float(outcome.get("point"))
+                    price = safe_float(outcome.get("price"))
+                    name = str(outcome.get("name", "")).lower()
+                    side = "over" if "over" in name else "under" if "under" in name else None
+                    if point == 2.5 and side and price and price > 1:
+                        result["totals25_best"][side] = max(result["totals25_best"].get(side, 0), price)
+                        book_total[side] = 1.0 / price
+        if len(book_h2h) >= 2:
+            overround = sum(book_h2h.values())
+            if overround:
+                h2h_by_book.append({k: v / overround for k, v in book_h2h.items()})
+        if len(book_total) == 2:
+            overround = sum(book_total.values())
+            if overround:
+                totals_by_book.append({k: v / overround for k, v in book_total.items()})
+    result["bookmakers"] = len(event.get("bookmakers", []))
+    for key in ("home", "draw", "away"):
+        values = [book[key] for book in h2h_by_book if key in book]
+        if values:
+            result["h2h_market_probability"][key] = float(np.mean(values))
+    for key in ("over", "under"):
+        values = [book[key] for book in totals_by_book if key in book]
+        if values:
+            result["totals25_market_probability"][key] = float(np.mean(values))
+    return result
+
+
+def build_value_bets(model: Dict[str, Any], odds: Dict[str, Any]) -> List[Dict[str, Any]]:
+    p = model["probabilities"]
+    rows: List[Dict[str, Any]] = []
+    candidates = [
+        ("Home win", "home", p["home_win"], odds["h2h_best"].get("home"), odds["h2h_market_probability"].get("home")),
+        ("Draw", "draw", p["draw"], odds["h2h_best"].get("draw"), odds["h2h_market_probability"].get("draw")),
+        ("Away win", "away", p["away_win"], odds["h2h_best"].get("away"), odds["h2h_market_probability"].get("away")),
+        ("Over 2.5 goals", "over25", p["over25"], odds["totals25_best"].get("over"), odds["totals25_market_probability"].get("over")),
+        ("Under 2.5 goals", "under25", p["under25"], odds["totals25_best"].get("under"), odds["totals25_market_probability"].get("under")),
+    ]
+    for label, key, model_probability, best_odds, market_probability in candidates:
+        if best_odds is None or best_odds <= 1:
+            continue
+        rows.append({
+            "Market": label,
+            "key": key,
+            "Best odds": best_odds,
+            "Model probability": model_probability,
+            "No-vig market probability": market_probability,
+            "Edge": (model_probability - market_probability) if market_probability is not None else None,
+            "Expected value": model_probability * best_odds - 1.0,
+        })
+    return rows
+
+
+# -----------------------------
+# Provider 3: Live Football API v1 team news
+# -----------------------------
+
+
+def live_football_get( api_key: str, endpoint: str, params: Optional[Dict[str, Any]] = None, retries_on_503: int = 0, ) -> Tuple[Optional[Any], Optional[str]]:
+    if not api_key:
+        return None, "Live Football API key is not configured."
+    query_params = dict(params or {})
+    query_params["api_key"] = api_key
+    clean_ep = endpoint.lstrip("/")
+    last_error = "No response from Live Football API."
+
+    for base in LIVE_FOOTBALL_API_BASES:
+        attempts = 0
+        while True:
+            payload, err, _ = http_json(
+                f"{base}/{clean_ep}",
+                headers={"Accept": "application/json"},
+                params=query_params,
+            )
+            if not err and payload is not None:
+                if isinstance(payload, dict) and payload.get("success") is False:
+                    last_error = str(payload.get("message") or payload.get("error") or "API returned success=false")
+                    break
+                if isinstance(payload, dict) and payload.get("error"):
+                    last_error = str(payload["error"])
+                    break
+                return payload, None
+            if err:
+                last_error = err
+            if err and "503" in err and attempts < retries_on_503:
+                attempts += 1
+                time.sleep(1.0)
+                continue
+            break
+    return None, last_error
+
+
+def _unwrap_data(payload: Any) -> Dict[str, Any]:
+    if isinstance(payload, dict):
+        inner = payload.get("data")
+        if isinstance(inner, dict):
+            return inner
+        return payload
+    return {}
+
+
+def _guess_lfa_team_id(team_name: str) -> str:
+    norm = normalize_team(team_name)
+    slug = re.sub(r"[^a-z0-9]+", "-", norm).strip("-")
+    return f"lfa-{slug}" if slug else ""
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_lfa_team_id_map(api_key: str, league_id: str) -> Dict[str, str]:
+    """Return {normalized_team_name: lfa_team_id} from /league_standings."""
+    mapping: Dict[str, str] = {}
+    if not api_key or not league_id:
+        return mapping
+
+    payload, err = live_football_get(
+        api_key,
+        "league_standings",
+        params={"league_id": league_id},
+        retries_on_503=0,
+    )
+    if err or not isinstance(payload, dict):
+        return mapping
+
+    data = _unwrap_data(payload)
+    blocks = data.get("standings")
+    if not isinstance(blocks, list):
+        return mapping
+
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        table = block.get("table")
+        if not isinstance(table, list):
+            continue
+        for row in table:
+            if not isinstance(row, dict):
+                continue
+            team = row.get("team") if isinstance(row.get("team"), dict) else {}
+            t_id = team.get("id")
+            t_name = team.get("name")
+            if t_id and t_name:
+                mapping[normalize_team(t_name)] = str(t_id)
+
+    return mapping
+
+
+def _resolve_lfa_team_id(api_key: str, league_id: str, team_name: str) -> str:
+    id_map = fetch_lfa_team_id_map(api_key, league_id)
+    norm = normalize_team(team_name)
+    if norm in id_map:
+        return id_map[norm]
+    for k, v in id_map.items():
+        if same_team(team_name, k):
+            return v
+    return _guess_lfa_team_id(team_name)
+
+
+def _find_match_id( api_key: str, league_id: str, kickoff_date: str, home_name: str, away_name: str, ) -> Tuple[Optional[str], Dict[str, Any], Optional[str]]:
+    # Primary: Home team ID; Fallback: Away team ID (useful when one team's endpoint returns 503 or times out)
+    candidate_team_ids: List[str] = []
+    for tid in (
+        _resolve_lfa_team_id(api_key, league_id, home_name),
+        _resolve_lfa_team_id(api_key, league_id, away_name),
+    ):
+        if tid and tid not in candidate_team_ids:
+            candidate_team_ids.append(tid)
+
+    if not candidate_team_ids:
+        return None, {}, "Could not determine team_id for home or away team."
+
+    last_err: Optional[str] = None
+    for team_id in candidate_team_ids:
+        payload, err = live_football_get(
+            api_key,
+            "team_matches",
+            params={"team_id": team_id},
+            retries_on_503=0,
+        )
+        if err:
+            last_err = err
+            continue
+
+        data = _unwrap_data(payload)
+        matches = data.get("matches")
+        if not isinstance(matches, list):
+            continue
+
+        # Pass 1: exact match on both teams and kickoff date
+        for m in matches:
+            if not isinstance(m, dict):
+                continue
+            m_date = str(m.get("date") or "")[:10]
+            h_obj = m.get("home") if isinstance(m.get("home"), dict) else {}
+            a_obj = m.get("away") if isinstance(m.get("away"), dict) else {}
+            h_name = h_obj.get("name") or m.get("home_name") or ""
+            a_name = a_obj.get("name") or m.get("away_name") or ""
+            if same_team(home_name, h_name) and same_team(away_name, a_name):
+                mid = m.get("id") or m.get("match_id")
+                if mid and (not kickoff_date or m_date == kickoff_date):
+                    return str(mid), m, None
+
+        # Pass 2: fallback match on both teams in case of UTC/local date boundary shift
+        for m in matches:
+            if not isinstance(m, dict):
+                continue
+            h_obj = m.get("home") if isinstance(m.get("home"), dict) else {}
+            a_obj = m.get("away") if isinstance(m.get("away"), dict) else {}
+            h_name = h_obj.get("name") or m.get("home_name") or ""
+            a_name = a_obj.get("name") or m.get("away_name") or ""
+            if same_team(home_name, h_name) and same_team(away_name, a_name):
+                mid = m.get("id") or m.get("match_id")
+                if mid:
+                    return str(mid), m, None
+
+    return None, {}, last_err
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_live_football_team_news( api_key: str, league_id: str, kickoff_date: str, home_name: str, away_name: str, ) -> Dict[str, Any]:
+    result: Dict[str, Any] = {
+        "match_id": None,
+        "fixture": {},
+        "injuries": {"home": [], "away": []},
+        "lineups": {},
+        "statistics": {},
+        "errors": [],
+    }
+    if not api_key:
+        result["errors"].append("Live Football API key is not configured.")
+        return result
+
+    match_id, fixture_obj, match_err = _find_match_id(
+        api_key, league_id, kickoff_date, home_name, away_name
+    )
+    if not match_id:
+        if match_err:
+            result["errors"].append(f"Team matches: {match_err}")
+        result["errors"].append("Match ID not found on Live Football API for this fixture.")
+        return result
+
+    result["match_id"] = match_id
+    result["fixture"] = fixture_obj
+
+    inj_payload, inj_err = live_football_get(
+        api_key,
+        "injuries",
+        params={"match_id": match_id},
+        retries_on_503=0,
+    )
+    if inj_err:
+        result["errors"].append(f"Injuries: {inj_err}")
+    else:
+        inj_data = _unwrap_data(inj_payload).get("injuries", {})
+        if isinstance(inj_data, dict):
+            result["injuries"] = {
+                "home": inj_data.get("home") if isinstance(inj_data.get("home"), list) else [],
+                "away": inj_data.get("away") if isinstance(inj_data.get("away"), list) else [],
+            }
+
+    line_payload, line_err = live_football_get(
+        api_key,
+        "lineups",
+        params={"match_id": match_id},
+        retries_on_503=0,
+    )
+    if line_err:
+        result["errors"].append(f"Lineups: {line_err}")
+    else:
+        line_data = _unwrap_data(line_payload)
+        if isinstance(line_data, dict) and line_data:
+            result["lineups"] = line_data
+
+    return result
+
+
+def _extract_player_names(items: Any) -> List[str]:
+    names: List[str] = []
+    if isinstance(items, list):
+        for p in items:
+            if isinstance(p, dict):
+                p_obj = p.get("player") if isinstance(p.get("player"), dict) else p
+                p_name = p_obj.get("name") or p_obj.get("player_name")
+                if p_name:
+                    names.append(str(p_name))
+            elif isinstance(p, str) and p.strip():
+                names.append(p.strip())
+    elif isinstance(items, str) and items.strip():
+        names = [x.strip() for x in items.split(",") if x.strip()]
+    return names
+
+
+def summarize_team_news(team_news: Dict[str, Any], home_name: str, away_name: str) -> Dict[str, Any]:
+    home_injuries: List[str] = []
+    away_injuries: List[str] = []
+    other_injuries: List[str] = []
+
+    inj_raw = team_news.get("injuries")
+    if isinstance(inj_raw, dict):
+        for side_key, target_list in (("home", home_injuries), ("away", away_injuries)):
+            for row in inj_raw.get(side_key) or []:
+                if not isinstance(row, dict):
+                    continue
+                player = (
+                    row.get("player_name")
+                    or row.get("name")
+                    or (row.get("player", {}).get("name") if isinstance(row.get("player"), dict) else None)
+                    or "Unknown Player"
+                )
+                reason = row.get("status") or row.get("reason") or row.get("type") or "Injured/Out"
+                target_list.append(f"{player} ({reason})")
+    elif isinstance(inj_raw, list):
+        for row in inj_raw:
+            if not isinstance(row, dict):
+                continue
+            player = row.get("player_name") or row.get("name") or "Unknown Player"
+            reason = row.get("status") or row.get("reason") or row.get("type") or "Injured/Out"
+            t_name = row.get("team_name") or row.get("team") or ""
+            label = f"{player} ({reason})"
+            if same_team(t_name, home_name):
+                home_injuries.append(label)
+            elif same_team(t_name, away_name):
+                away_injuries.append(label)
+            else:
+                other_injuries.append(f"{t_name}: {label}".strip(": "))
+
+    lineups_raw = team_news.get("lineups") or {}
+    home_lineup: List[str] = []
+    away_lineup: List[str] = []
+    home_formation: Optional[str] = None
+    away_formation: Optional[str] = None
+
+    if isinstance(lineups_raw, dict):
+        form_obj = lineups_raw.get("formation")
+        if isinstance(form_obj, dict):
+            home_formation = str(form_obj.get("home")) if form_obj.get("home") is not None else None
+            away_formation = str(form_obj.get("away")) if form_obj.get("away") is not None else None
+        elif form_obj is not None:
+            home_formation = str(form_obj)
+
+        h_side = lineups_raw.get("home")
+        if isinstance(h_side, dict):
+            home_lineup = _extract_player_names(h_side.get("starting") or h_side.get("startXI") or h_side.get("lineup"))
+            if not home_formation and h_side.get("formation"):
+                home_formation = str(h_side.get("formation"))
+        elif isinstance(h_side, list):
+            home_lineup = _extract_player_names(h_side)
+
+        a_side = lineups_raw.get("away")
+        if isinstance(a_side, dict):
+            away_lineup = _extract_player_names(a_side.get("starting") or a_side.get("startXI") or a_side.get("lineup"))
+            if not away_formation and a_side.get("formation"):
+                away_formation = str(a_side.get("formation"))
+        elif isinstance(a_side, list):
+            away_lineup = _extract_player_names(a_side)
+
+    has_data = bool(
+        home_injuries or away_injuries or other_injuries or home_lineup or away_lineup or team_news.get("fixture")
+    )
+    return {
+        "has_data": has_data,
+        "home_injuries": home_injuries,
+        "away_injuries": away_injuries,
+        "other_injuries": other_injuries,
+        "home_lineup": home_lineup,
+        "away_lineup": away_lineup,
+        "home_formation": home_formation,
+        "away_formation": away_formation,
+    }
+
+
+# -----------------------------
+# Model: Elo + Venue xG + Dixon-Coles
+# -----------------------------
+
+
+def _dixon_coles_tau(x: int, y: int, lam_x: float, lam_y: float, rho: float) -> float:
+    if x == 0 and y == 0:
+        return max(0.05, 1.0 - lam_x * lam_y * rho)
+    if x == 0 and y == 1:
+        return max(0.05, 1.0 + lam_x * rho)
+    if x == 1 and y == 0:
+        return max(0.05, 1.0 + lam_y * rho)
+    if x == 1 and y == 1:
+        return max(0.05, 1.0 - rho)
+    return 1.0
+
+
+def build_ratings_and_xg_stats( finished_matches: List[Dict[str, Any]], attack_power: float = DEFAULT_ATTACK_POWER, ) -> Dict[str, Any]:
+    elo: Dict[str, float] = {}
+    last_played: Dict[str, datetime] = {}
+
+    home_gf: Dict[str, List[float]] = {}
+    home_ga: Dict[str, List[float]] = {}
+    away_gf: Dict[str, List[float]] = {}
+    away_ga: Dict[str, List[float]] = {}
+    all_home_goals: List[float] = []
+    all_away_goals: List[float] = []
+
+    sorted_matches = sorted(finished_matches, key=lambda m: m.get("utcDate", ""))
+    for m in sorted_matches:
+        h_raw = m.get("homeTeam", {}).get("name")
+        a_raw = m.get("awayTeam", {}).get("name")
+        h_key, a_key = normalize_team(h_raw), normalize_team(a_raw)
+        ft = (m.get("score") or {}).get("fullTime") or {}
+        hg, ag = ft.get("home"), ft.get("away")
+        if not h_key or not a_key or hg is None or ag is None:
+            continue
+
+        hg_f, ag_f = float(hg), float(ag)
+        elo.setdefault(h_key, 1500.0)
+        elo.setdefault(a_key, 1500.0)
+
+        h_elo = elo[h_key]
+        a_elo = elo[a_key]
+        exp_h = 1.0 / (1.0 + 10.0 ** ((a_elo - (h_elo + HOME_ELO_ADVANTAGE)) / 400.0))
+        exp_a = 1.0 - exp_h
+
+        if hg_f > ag_f:
+            act_h, act_a = 1.0, 0.0
+        elif hg_f < ag_f:
+            act_h, act_a = 0.0, 1.0
+        else:
+            act_h, act_a = 0.5, 0.5
+
+        goal_diff_mult = math.log(abs(hg_f - ag_f) + 1.0) + 1.0
+        k_factor = 24.0 * goal_diff_mult
+        elo[h_key] = h_elo + k_factor * (act_h - exp_h)
+        elo[a_key] = a_elo + k_factor * (act_a - exp_a)
+
+        dt = parse_datetime(m.get("utcDate"))
+        if dt:
+            last_played[h_key] = dt
+            last_played[a_key] = dt
+
+        home_gf.setdefault(h_key, []).append(hg_f)
+        home_ga.setdefault(h_key, []).append(ag_f)
+        away_gf.setdefault(a_key, []).append(ag_f)
+        away_ga.setdefault(a_key, []).append(hg_f)
+        all_home_goals.append(hg_f)
+        all_away_goals.append(ag_f)
+
+    league_home_avg = float(np.mean(all_home_goals)) if all_home_goals else 1.50
+    league_away_avg = float(np.mean(all_away_goals)) if all_away_goals else 1.18
+
+    return {
+        "elo": elo,
+        "last_played": last_played,
+        "home_gf": home_gf,
+        "home_ga": home_ga,
+        "away_gf": away_gf,
+        "away_ga": away_ga,
+        "league_home_avg": max(0.6, league_home_avg),
+        "league_away_avg": max(0.5, league_away_avg),
+        "attack_power": attack_power,
+    }
+
+
+def _team_venue_rate(values: List[float], fallback: float, window: int = 10) -> float:
+    if not values:
+        return fallback
+    recent = values[-window:]
+    weights = np.linspace(0.6, 1.0, len(recent))
+    return float(np.average(recent, weights=weights))
+
+
+def predict_match( home_name: str, away_name: str, kickoff_dt: Optional[datetime], ratings_data: Dict[str, Any], *, home_tactical_adj: float = 0.0, away_tactical_adj: float = 0.0, odds_blend_weight: float = 0.0, odds_parsed: Optional[Dict[str, Any]] = None, injury_penalty_home: float = 0.0, injury_penalty_away: float = 0.0, ) -> Dict[str, Any]:
+    h_key, a_key = normalize_team(home_name), normalize_team(away_name)
+    elo_map = ratings_data["elo"]
+    last_played = ratings_data["last_played"]
+    h_elo = elo_map.get(h_key, 1500.0)
+    a_elo = elo_map.get(a_key, 1500.0)
+
+    league_h_avg = ratings_data["league_home_avg"]
+    league_a_avg = ratings_data["league_away_avg"]
+    atk_pow = ratings_data.get("attack_power", DEFAULT_ATTACK_POWER)
+
+    h_att_rate = _team_venue_rate(ratings_data["home_gf"].get(h_key, []), league_h_avg)
+    h_def_rate = _team_venue_rate(ratings_data["home_ga"].get(h_key, []), league_a_avg)
+    a_att_rate = _team_venue_rate(ratings_data["away_gf"].get(a_key, []), league_a_avg)
+    a_def_rate = _team_venue_rate(ratings_data["away_ga"].get(a_key, []), league_h_avg)
+
+    h_att_idx = clamp((h_att_rate / league_h_avg) ** atk_pow, 0.55, 1.65)
+    a_def_idx = clamp((a_def_rate / league_h_avg) ** atk_pow, 0.55, 1.65)
+    a_att_idx = clamp((a_att_rate / league_a_avg) ** atk_pow, 0.55, 1.65)
+    h_def_idx = clamp((h_def_rate / league_a_avg) ** atk_pow, 0.55, 1.65)
+
+    elo_diff = (h_elo + HOME_ELO_ADVANTAGE) - a_elo
+    elo_h_factor = clamp(1.0 + elo_diff / 1800.0, 0.72, 1.38)
+    elo_a_factor = clamp(1.0 - elo_diff / 1800.0, 0.72, 1.38)
+
+    rest_days_h: Optional[float] = None
+    rest_days_a: Optional[float] = None
+    rest_mult_h = 1.0
+    rest_mult_a = 1.0
+    if kickoff_dt:
+        if h_key in last_played:
+            rest_days_h = (kickoff_dt - last_played[h_key]).total_seconds() / 86400.0
+            if rest_days_h < 3.5:
+                rest_mult_h = 0.93
+        if a_key in last_played:
+            rest_days_a = (kickoff_dt - last_played[a_key]).total_seconds() / 86400.0
+            if rest_days_a < 3.5:
+                rest_mult_a = 0.93
+
+    tac_mult_h = math.exp(home_tactical_adj * 0.08)
+    tac_mult_a = math.exp(away_tactical_adj * 0.08)
+    inj_mult_h = clamp(1.0 - injury_penalty_home, 0.65, 1.0)
+    inj_mult_a = clamp(1.0 - injury_penalty_away, 0.65, 1.0)
+
+    lam_home = clamp(
+        league_h_avg * h_att_idx * a_def_idx * elo_h_factor * rest_mult_h * tac_mult_h * inj_mult_h,
+        0.25,
+        4.80,
+    )
+    lam_away = clamp(
+        league_a_avg * a_att_idx * h_def_idx * elo_a_factor * rest_mult_a * tac_mult_a * inj_mult_a,
+        0.20,
+        4.50,
     )
 
+    matrix = np.zeros((MAX_GOALS, MAX_GOALS), dtype=float)
+    pmf_h = [math.exp(-lam_home) * (lam_home ** i) / math.factorial(i) for i in range(MAX_GOALS)]
+    pmf_a = [math.exp(-lam_away) * (lam_away ** j) / math.factorial(j) for j in range(MAX_GOALS)]
 
-# Load Data
-(
-    m_usd_b,
-    m_usd_s,
-    m_jpy_b,
-    m_jpy_s,
-    g_usd_m,
-    g_jpy_b,
-    g_jpy_s,
-    g_usd_j,
-    gold_oz,
-    source_status,
-) = get_comprehensive_market_data()
-current_time_str = datetime.now().strftime("%Y-ခုနှစ်၊ %m-လ၊ %d-ရက် (%H:%M:%S နာရီ)")
+    for i in range(MAX_GOALS):
+        for j in range(MAX_GOALS):
+            tau = _dixon_coles_tau(i, j, lam_home, lam_away, DIXON_COLES_RHO)
+            matrix[i, j] = pmf_h[i] * pmf_a[j] * tau
 
-# App Title & Header
-st.markdown(
-    "<h1 style='text-align: center;'>🇲🇲 🇯🇵 RATES INFO: Advanced Market"
-    " Hub</h1>",
-    unsafe_allow_html=True,
-)
-st.markdown(
-    f"<p style='text-align: center; color: gray;'>စနစ် အချိန်: {current_time_str}"
-    f" | Status: {source_status}</p>",
-    unsafe_allow_html=True,
-)
+    total_mass = float(np.sum(matrix))
+    if total_mass > 0:
+        matrix /= total_mass
 
-# ဈေးကွက် သတိပေးချက်များ (USD နှင့် JPY နှစ်ခုစလုံးအတွက်)
-st.warning(
-    "⚠️ **ဈေးကွက် အထူးသတိပေးချက် (Market Warning):**\n"
-    "* **🇺🇸 ဒေါ်လာ (USD) ဈေးကွက်:** ပြင်ပပေါက်ဈေးနှင့် အစိုးရပေါက်ဈေး"
-    " ကွာဟချက်များ၊ ဗဟိုဘဏ်မူဝါဒ အပြောင်းအလဲကြောင့် USD/MMK နှုန်းထားမှာ"
-    " **သိသာစွာ အတက်/အကျ အစွန်းရောက်နိုင်ခြေ** ရှိပါသည်။\n* **🇯🇵 ဂျပန်ယန်း"
-    " (JPY) ဈေးကွက်:** TradingView၊ Forex.com နှင့် ကမ္ဘာ့ရွှေဈေး"
-    " အတက်အကျများကြောင့် ယန်းငွေ ဝယ်ဈေး/ရောင်းဈေးများ မတည်ငြိမ်ဘဲ"
-    " အတက်အကျကြမ်းနိုင်ပါသည်အထူးဂရုပြုပါ။"
-)
+    home_win = float(np.sum(np.tril(matrix, -1)))
+    draw = float(np.sum(np.diag(matrix)))
+    away_win = float(np.sum(np.triu(matrix, 1)))
 
-# Navigation Tabs (Tab အသစ်တစ်ခုပါ ထည့်သွင်းထားသည်)
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
-    "💱 ပေါက်ဈေးများနှင့် တွက်ချက်မှု",
-    "📊 ဈေးနှုန်းဇယားများ",
-    "🏛️ ဗဟိုဘဏ် သတင်းများ",
-    "🥇 ကမ္ဘာ့ရွှေနှင့် ဈေးကွက်သုံးသပ်ချက်",
-    "🌐 TradingView & Forex အခြေပြု ခန့်မှန်းချက်",  # Tab အသစ်
-    "🎯 ခန့်မှန်းချက် မှန်ကန်မှု မှတ်တမ်း",
-])
+    over25 = 0.0
+    under25 = 0.0
+    home_2plus_goals = 0.0
+    away_2plus_goals = 0.0
+    score_list: List[Tuple[str, float]] = []
 
-# ==================== TAB 1: 💱 ပြင်ပပေါက်ဈေး & အစိုးရပေါက်ဈေး (Buy/Sell) ====================
-with tab1:
-  st.subheader(
-      "📌 RATES INFO: အမေရိကန်ဒေါ်လာနှင့် ဂျပန်ယန်း (ဝယ်ဈေး/ရောင်းဈေး)"
-  )
+    for i in range(MAX_GOALS):
+        for j in range(MAX_GOALS):
+            prob = float(matrix[i, j])
+            score_list.append((f"{i}-{j}", prob))
+            if i + j >= 3:
+                over25 += prob
+            else:
+                under25 += prob
+            if i >= 2:
+                home_2plus_goals += prob
+            if j >= 2:
+                away_2plus_goals += prob
 
-  st.markdown("### 🌐 ၁။ ပြင်ပပေါက်ဈေး (Open / Black Market Rates)")
-  col_m1, col_m2, col_m3, col_m4 = st.columns(4)
-  col_m1.metric(label="💵 USD (ဝယ်ဈေး)", value=f"{m_usd_b:,.0f} MMK")
-  col_m2.metric(label="💵 USD (ရောင်းဈေး)", value=f"{m_usd_s:,.0f} MMK")
-  col_m3.metric(label="💴 JPY (ဝယ်ဈေး)", value=f"{m_jpy_b:.2f} MMK")
-  col_m4.metric(label="💴 JPY (ရောင်းဈေး)", value=f"{m_jpy_s:.2f} MMK")
+    score_list.sort(key=lambda x: x[1], reverse=True)
 
-  st.markdown("### 🏛️ ၂။ အစိုးရပေါက်ဈေး / ဘဏ်ရည်ညွှန်းဈေး (Official Rates)")
-  col_g1, col_g2, col_g3, col_g4 = st.columns(4)
-  col_g1.metric(label="🇺🇸 USD (ရည်ညွှန်း)", value=f"{g_usd_m:,.0f} MMK")
-  col_g2.metric(label="💱 USD/JPY Rate", value=f"{g_usd_j:.2f}")
-  col_g3.metric(label="💴 JPY (ဝယ်ဈေး)", value=f"{g_jpy_b:.2f} MMK")
-  col_g4.metric(label="💴 JPY (ရောင်းဈေး)", value=f"{g_jpy_s:.2f} MMK")
+    mkt_h2h = (odds_parsed or {}).get("h2h_market_probability") or {}
+    if odds_blend_weight > 0 and all(k in mkt_h2h for k in ("home", "draw", "away")):
+        w = clamp(odds_blend_weight, 0.0, 0.85)
+        home_win = (1.0 - w) * home_win + w * float(mkt_h2h["home"])
+        draw = (1.0 - w) * draw + w * float(mkt_h2h["draw"])
+        away_win = (1.0 - w) * away_win + w * float(mkt_h2h["away"])
+        s = home_win + draw + away_win
+        home_win, draw, away_win = home_win / s, draw / s, away_win / s
 
-  st.divider()
-  st.subheader("🧮 ဂျပန်ယန်း ငွေလဲပမာဏ တွက်ချက်ရန်")
-  jpy_amount = st.number_input(
-      "ထည့်မည့် ဂျပန်ယန်း ပမာဏ (JPY)", min_value=1, value=10000, step=1000
-  )
-  calc_market = jpy_amount * m_jpy_s
-  calc_gov = jpy_amount * g_jpy_s
-  st.success(
-      f"💰 **{jpy_amount:,} JPY** ဖြင့် ဝယ်ယူမည်ဆိုပါက:\n* ပြင်ပပေါက်ဈေးဖြင့် ="
-      f" **{calc_market:,.2f} MMK**\n* အစိုးရပေါက်ဈေးဖြင့် ="
-      f" **{calc_gov:,.2f} MMK**"
-  )
+    mkt_tot = (odds_parsed or {}).get("totals25_market_probability") or {}
+    if odds_blend_weight > 0 and "over" in mkt_tot and "under" in mkt_tot:
+        w = clamp(odds_blend_weight, 0.0, 0.85)
+        over25 = (1.0 - w) * over25 + w * float(mkt_tot["over"])
+        under25 = (1.0 - w) * under25 + w * float(mkt_tot["under"])
+        ts = over25 + under25
+        over25, under25 = over25 / ts, under25 / ts
 
-# ==================== TAB 2: 📊 Charts ====================
-with tab2:
-  st.subheader("📈 USD/MMK & JPY/MMK ဈေးနှုန်း Trend (15m Auto-Updated)")
-  dates = pd.date_range(end=datetime.now(), periods=7, freq="D")
-  trend_vals = [
-      m_jpy_s - 0.4,
-      m_jpy_s - 0.2,
-      m_jpy_s + 0.1,
-      m_jpy_s - 0.1,
-      m_jpy_s + 0.3,
-      m_jpy_s + 0.1,
-      m_jpy_s,
-  ]
+    expected_gd = lam_home - lam_away
+    expected_total_goals = lam_home + lam_away
 
-  fig, ax = plt.subplots(figsize=(10, 4))
-  ax.plot(
-      dates.strftime("%m-%d"),
-      trend_vals,
-      marker="o",
-      color="crimson",
-      linewidth=2,
-  )
-  ax.set_title("Market JPY/MMK Trend (RATES INFO Live Feed)")
-  ax.set_ylabel("MMK")
-  ax.grid(True, linestyle="--", alpha=0.5)
-  st.pyplot(fig)
+    return {
+        "home_elo": h_elo,
+        "away_elo": a_elo,
+        "lam_home": lam_home,
+        "lam_away": lam_away,
+        "expected_gd": expected_gd,
+        "expected_total_goals": expected_total_goals,
+        "rest_days_h": rest_days_h,
+        "rest_days_a": rest_days_a,
+        "top_scores": score_list[:5],
+        "probabilities": {
+            "home_win": home_win,
+            "draw": draw,
+            "away_win": away_win,
+            "over25": over25,
+            "under25": under25,
+            "home_2plus_goals": home_2plus_goals,
+            "away_2plus_goals": away_2plus_goals,
+        },
+    }
 
-# ==================== TAB 3: 🏛️ ဗဟိုဘဏ် သတင်းများ (အချိန်အပြည့်အစုံ) ====================
-with tab3:
-  st.subheader(
-      "🇺🇸 ၁။ အမေရိကန်ဗဟိုဘဏ် (Fed) နှင့် 🇯🇵 ၂။ ဂျပန်ဗဟိုဘဏ် (BOJ) သတင်းများ"
-  )
-  st.markdown(f"""
-    * **🇺🇸 အမေရိကန် Fed သတင်းထုတ်ပြန်ချိန်:** 2026-ခုနှစ်၊ နိုဝင်ဘာလ၊ ၁၁-ရက် (၁၈:၃၀ နာရီ)
-      * *အခြေအနေ:* အတိုးနှုန်းကို ဆက်လက်ထိန်းသိမ်းထားပြီး ပြင်ပဈေးကွက်အတွင်း ဒေါ်လာငွေကြေး புောင်ပွမှုအပေါ် ဆက်လက်စောင့်ကြည့်နေသည်။
-    * **🇯🇵 ဂျပန် BOJ သတင်းထုတ်ပြန်ချိန်:** 2026-ခုနှစ်၊ နိုဝင်ဘာလ၊ ၁၂-ရက် (၀၉:၀၀ နာရီ)
-      * *အခြေအနေ:* ဂျပန်ဗဟိုဘဏ်သည် အတိုးနှုန်းကို တဖြည်းဖြည်း တိုးမြှင့်မည့် မူဝါဒကို ဆက်လက်ကိုင်စွဲထားရာ ယန်းငွေတန်ဖိုး အတက်အကျ ဖြစ်ပေါ်စေနိုင်သည်။
-    """)
 
-# ==================== TAB 4: 🥇 ကမ္ဘာ့ရွှေဈေးနှင့် သုံးသပ်ချက် ====================
-with tab4:
-  st.subheader("🥇 ကမ္ဘာ့အခေါက်ရွှေဈေး Update နှင့် ရွှေနှင့်ယန်း ဆက်စပ်မှု")
-  st.info(f"🪙 **လက်ရှိ ကမ္ဘာ့ရွှေဈေး (Live Gold Price):** ${gold_oz:,.2f} / oz")
-  st.markdown("""
-    * **သုံးသပ်ချက်:** ကမ္ဘာ့ရွှေဈေး မြင့်တက်လာမှုသည် လုံခြုံစိတ်ချရသော ရင်းနှီးမြှုပ်နှံမှုများကို ဦးတည်စေပြီး ဂျပန်ယန်းနှင့် ဒေါ်လာငွေကြေးတို့၏ ဈေးကွက်တန်ဖိုးများကို တိုက်ရိုက် သက်ရောက်မှု ရှိစေပါသည်။
-    """)
+# -----------------------------
+# Burmese Detailed Analysis Engine
+# -----------------------------
 
-# ==================== TAB 5: 🌐 TradingView & Forex အခြေပြု ခန့်မှန်းချက် (Tab အသစ်) ====================
-with tab5:
-  st.subheader(
-      "🌐 TradingView၊ Forex.com နှင့် Online Platforms များအခြေပြု စျေးကွက်ခန့်မှန်းချက်"
-  )
-  st.markdown("""
-    ဤကဏ္ဍတွင် ကမ္ဘာ့ထိပ်တန်း စီးပွားရေးပလက်ဖောင်းများဖြစ်သော **TradingView, Forex.com, Bloomberg နှင့် Reuters** တို့မှ ရရှိသော Live Technical Indicators များနှင့် စီးပွားရေးသတင်းများကို ပေါင်းစပ်၍ မြန်မာဘာသာဖြင့် အသေးစိတ် သုံးသပ်ဖော်ပြထားပါသည်။
 
-    * **📊 TradingView Technical Outlook:**
-      * *Moving Averages & RSI:* ဈေးကွက်အတွင်း USD/JPY နှင့် JPY/MMK တို့၏ Relative Strength Index (RSI) မှာ Overbought/Oversold ဧရိယာအကြား ရပ်တည်နေပြီး လာမည့်တစ်ပတ်တွင် မျဉ်းကွေးများ တက်လာနိုင်ချေ ရှိနေသည်။
-    * **💱 Forex.com & Online Platforms ၏ အချက်အလက်များ:**
-      * ကမ္ဘာ့ ငွေကြေးဈေးကွက် ဖိုရမ်များနှင့် အွန်လိုင်း ပလက်ဖောင်းများ၏ စီးပွားရေးဆွေးနွေးချက်များအရ၊ အမေရိကန်ဒေါ်လာ အညွှန်းကိန်း (DXY) ၏ အတက်အကျနှင့် ဂျပန်နိုင်ငံ၏ ငွေကြေးဖောင်းပွမှု အချက်အလက်များသည် ယန်းဈေးနှုန်းကို ဆက်လက် ဦးဆောင်နေမည် ဖြစ်ပါသည်။
-    * **🔮 လာမည့်တစ်ပတ် ယန်းဈေး ခန့်မှန်းချက် (Market Outlook):**
-      * အထက်ပါ ပလက်ဖောင်းများ၏ ဒေတာများကို ခြုံငုံသုံးသပ်ချက်အရ လာမည့်ရက်ပိုင်းအတွင်း ဂျပန်ယန်းဈေးနှုန်းသည် ပြင်ပပေါက်ဈေးတွင် **အနည်းငယ် မြင့်တက်လာနိုင်ချေ (Bullish Rebound)** ရှိနေပြီး ဝယ်ယူလိုသူများအတွက် သင့်တင့်သော အချိန်အခါဖြစ်ကြောင်း ခန့်မှန်းရပါသည်။
-    """)
+def _pick_score(prob: float, vb: Optional[Dict[str, Any]], odds_fetched: bool) -> float:
+    score = prob * 100.0
+    if odds_fetched and vb:
+        ev = vb.get("Expected value") or 0.0
+        edge = vb.get("Edge") or 0.0
+        if ev > 0:
+            score += ev * 45.0 + max(0.0, edge) * 60.0
+        elif ev < -0.05:
+            score += ev * 25.0
+    return score
 
-# ==================== TAB 6: 🎯 ခန့်မှန်းချက် မှန်ကန်မှု မှတ်တမ်း ====================
-with tab6:
-  st.subheader("🎯 အက်ပ်၏ ခန့်မှန်းချက် မှန်ကန်မှု မှတ်တမ်း (Accuracy Log)")
-  st.markdown("""
-    * **📅 မှတ်တမ်း (၁): 2026-ခုနှစ်၊ နိုဝင်ဘာလ၊ ၀၈-ရက် (၁၄:၀၀ နာရီ)**
-      * *ခန့်မှန်းချက်:* TradingView ဒေတာများအရ ပြင်ပပေါက်ဈေးကွက်တွင် USD နှင့် JPY ဝယ်ဈေး/ရောင်းဈေးများ တည်ငြိမ်နေမည်။
-      * *ရလဒ်:* **✅ ၁၀၀% မှန်ကန်ခဲ့သည်**
-    """)
 
-# Footer
-st.markdown("---")
-st.markdown(
-    "<p style='text-align: center; color: gray; font-size: 12px;'>RATES INFO:"
-    " Advanced Market Hub | 15-Min Auto Refresh Enabled</p>",
-    unsafe_allow_html=True,
-)
+def build_detailed_burmese_analysis( home_name: str, away_name: str, model: Dict[str, Any], odds_parsed: Dict[str, Any], value_bets: List[Dict[str, Any]], team_news_summary: Dict[str, Any], odds_fetched: bool, live_fetched: bool, ) -> str:
+    p = model["probabilities"]
+    gd = model["expected_gd"]
+    lam_h = model["lam_home"]
+    lam_a = model["lam_away"]
+    total_xg = lam_h + lam_a
+
+    vb_by_key = {row["key"]: row for row in value_bets}
+
+    home_score = _pick_score(p["home_win"], vb_by_key.get("home"), odds_fetched)
+    away_score = _pick_score(p["away_win"], vb_by_key.get("away"), odds_fetched)
+    if home_score >= away_score:
+        best_team_label = f"အိမ်ကွင်းအသင်း ({home_name})"
+        best_team_prob = p["home_win"]
+        best_team_vb = vb_by_key.get("home")
+    else:
+        best_team_label = f"အဝေးကွင်းအသင်း ({away_name})"
+        best_team_prob = p["away_win"]
+        best_team_vb = vb_by_key.get("away")
+
+    over_score = _pick_score(p["over25"], vb_by_key.get("over25"), odds_fetched)
+    under_score = _pick_score(p["under25"], vb_by_key.get("under25"), odds_fetched)
+    if over_score >= under_score:
+        best_ou_label = "ဂိုးပေါင်းအပေါ် (Over 2.5 goals)"
+        best_ou_prob = p["over25"]
+        best_ou_vb = vb_by_key.get("over25")
+    else:
+        best_ou_label = "ဂိုးပေါင်းအောက် (Under 2.5 goals)"
+        best_ou_prob = p["under25"]
+        best_ou_vb = vb_by_key.get("under25")
+
+    overall_options = [
+        (best_team_label, best_team_prob, best_team_vb, home_score if home_score >= away_score else away_score),
+        (best_ou_label, best_ou_prob, best_ou_vb, max(over_score, under_score)),
+    ]
+    best_overall_label, best_overall_prob, best_overall_vb, _ = max(overall_options, key=lambda x: x[3])
+
+    lines: List[str] = ["### အသေးစိတ် သုံးသပ်ချက်", ""]
+
+    lines.append(f"၁။ **အရွေးချယ်သင့်ဆုံး - {best_overall_label}:**")
+    d1 = (
+        f"ရွေးချယ်မှု၏ Model ဖြစ်နိုင်ခြေမှာ **{best_overall_prob * 100:.1f}%** အထိ ရှိနေပြီး "
+        f"ခန့်မှန်းဂိုးစုစုပေါင်းမှာ **{total_xg:.2f} ဂိုး** (အိမ်ကွင်း **{lam_h:.2f}** / အဝေးကွင်း **{lam_a:.2f}**) ဖြစ်ပါသည်။"
+    )
+    if odds_fetched and best_overall_vb:
+        ov_odds = best_overall_vb["Best odds"]
+        ov_ev = (best_overall_vb["Expected value"] or 0.0) * 100.0
+        ov_edge = (best_overall_vb["Edge"] or 0.0) * 100.0
+        mkt_p = best_overall_vb.get("No-vig market probability")
+        mkt_txt = f" (No-vig ဈေးကွက် {mkt_p * 100:.1f}%)" if mkt_p is not None else ""
+        lines.append(f" * {d1} အကောင်းဆုံး ပေါက်ကြေးမှာ **{ov_odds:.2f}** ရှိနေပါတယ်။")
+        lines.append(
+            f" * Value Bet Finder အရ Model နှင့် ဈေးကွက်ကွာဟချက် (**Edge {ov_edge:+.1f} pp**{mkt_txt}) ရှိပြီး "
+            f"**Expected Value ({ov_ev:+.1f}%)** ဖြစ်သောကြောင့် ရွေးချယ်မှုများထဲတွင် **Value** အကိုက်ညီဆုံး ဖြစ်ပါသည်။"
+        )
+    else:
+        lines.append(f" * {d1}")
+        if not odds_fetched:
+            lines.append(" * Odds API မခေါ်ရသေးသဖြင့် Value Bet (Odds / Edge / EV) တွက်ချက်မှု မပါဝင်သေးပါ။")
+
+    lines.append("")
+
+    home_2p = p["home_2plus_goals"] * 100.0
+    away_2p = p["away_2plus_goals"] * 100.0
+    lines.append(f"၂။ **အသင်းရွေးချယ်မှု - အိမ်ကွင်း ({home_name}) vs အဝေးကွင်း ({away_name}):**")
+    lines.append(
+        f" * အသင်းဘက်က နှိုင်းယှဉ်ကြည့်လျှင် အိမ်ကွင်း ({home_name}) နိုင်ခြေ **{p['home_win']*100:.1f}%**၊ "
+        f"သရေ **{p['draw']*100:.1f}%**၊ အဝေးကွင်း ({away_name}) နိုင်ခြေ **{p['away_win']*100:.1f}%** ရှိပြီး "
+        f"ခန့်မှန်းဂိုးကွာခြားချက် (**Expected Goal Difference**) ကလည်း **{gd:+.2f} ဂိုး** ဖြစ်ပါသည်။"
+    )
+    lines.append(
+        f" * ထို့အပြင် {home_name} က ၂ ဂိုးပြတ်နိုင်ခြေ **{home_2p:.1f}%** ရှိပြီး {away_name} က ၂ ဂိုးပြတ်နိုင်ခြေ **{away_2p:.1f}%** ရှိသဖြင့် "
+        f"နှစ်သင်း၏ တိုက်စစ်/ခံစစ် ဟန်ချက်ကို နှိုင်းယှဉ်နိုင်ပါသည်။"
+    )
+
+    h_vb = vb_by_key.get("home")
+    a_vb = vb_by_key.get("away")
+    if odds_fetched and (h_vb or a_vb):
+        vb_parts: List[str] = []
+        if h_vb:
+            vb_parts.append(f"အိမ်ကွင်း Odds {h_vb['Best odds']:.2f} / EV {(h_vb['Expected value'] or 0)*100:+.1f}%")
+        if a_vb:
+            vb_parts.append(f"အဝေးကွင်း Odds {a_vb['Best odds']:.2f} / EV {(a_vb['Expected value'] or 0)*100:+.1f}%")
+        lines.append(f" * **Value Bet Finder (1X2):** {' | '.join(vb_parts)} ဖြစ်ပါသည်။")
+
+    team_note_extra = ""
+    if odds_fetched and best_team_vb:
+        team_note_extra = f" (Odds {best_team_vb['Best odds']:.2f}, EV {(best_team_vb['Expected value'] or 0)*100:+.1f}%)"
+    lines.append(
+        f" * **အသင်းရွေးချယ်မှု အောက်ခြေမှတ်ချက် — ရွေးချယ်လို့ အကောင်းဆုံးမှာ {best_team_label} "
+        f"(Model {best_team_prob*100:.1f}%{team_note_extra}) ဖြစ်ပါသည်။**"
+    )
+
+    lines.append("")
+
+    lines.append("၃။ **ဂိုးပေါင်းရွေးချယ်မှု - ဂိုးပေါင်းအပေါ် (Over 2.5) vs ဂိုးပေါင်းအောက် (Under 2.5):**")
+    over_txt = f"ဂိုးပေါင်းအပေါ် (Over 2.5) ဖြစ်နိုင်ခြေ **{p['over25']*100:.1f}%**"
+    under_txt = f"ဂိုးပေါင်းအောက် (Under 2.5) ဖြစ်နိုင်ခြေ **{p['under25']*100:.1f}%**"
+    if odds_fetched:
+        o_vb = vb_by_key.get("over25")
+        u_vb = vb_by_key.get("under25")
+        if o_vb:
+            over_txt += f" (Best Odds {o_vb['Best odds']:.2f}, EV {(o_vb['Expected value'] or 0)*100:+.1f}%)"
+        if u_vb:
+            under_txt += f" (Best Odds {u_vb['Best odds']:.2f}, EV {(u_vb['Expected value'] or 0)*100:+.1f}%)"
+    lines.append(f" * {over_txt} နှင့် {under_txt} ရှိပြီး မျှော်မှန်းဂိုးစုစုပေါင်းမှာ **{total_xg:.2f} ဂိုး** ဖြစ်ပါသည်။")
+
+    ou_note_extra = ""
+    if odds_fetched and best_ou_vb:
+        ou_note_extra = f" (Odds {best_ou_vb['Best odds']:.2f}, EV {(best_ou_vb['Expected value'] or 0)*100:+.1f}%)"
+    lines.append(
+        f" * **ဂိုးပေါင်းရွေးချယ်မှု အောက်ခြေမှတ်ချက် — ရွေးချယ်လို့ အကောင်းဆုံးမှာ {best_ou_label} "
+        f"(Model {best_ou_prob*100:.1f}%{ou_note_extra}) ဖြစ်ပါသည်။**"
+    )
+
+    lines.append("")
+
+    lines.append("၄။ **Lineup နှင့် Injury List သုံးသပ်ချက် (Live Football API):**")
+    if live_fetched and team_news_summary.get("has_data"):
+        h_inj = team_news_summary.get("home_injuries") or []
+        a_inj = team_news_summary.get("away_injuries") or []
+        h_lu = team_news_summary.get("home_lineup") or []
+        a_lu = team_news_summary.get("away_lineup") or []
+        h_form = team_news_summary.get("home_formation")
+        a_form = team_news_summary.get("away_formation")
+
+        h_inj_txt = ", ".join(h_inj) if h_inj else "ဒဏ်ရာ/ပွဲပယ် စာရင်း မတွေ့ရှိပါ"
+        a_inj_txt = ", ".join(a_inj) if a_inj else "ဒဏ်ရာ/ပွဲပယ် စာရင်း မတွေ့ရှိပါ"
+        lines.append(f" * **ဒဏ်ရာ/ပွဲပယ်စာရင်း (Injuries):** {home_name} — {h_inj_txt} | {away_name} — {a_inj_txt}။")
+
+        if h_lu or a_lu or h_form or a_form:
+            h_lu_txt = f"({h_form}) " + ", ".join(h_lu[:11]) if h_lu else (h_form or "Lineup မထွက်သေးပါ")
+            a_lu_txt = f"({a_form}) " + ", ".join(a_lu[:11]) if a_lu else (a_form or "Lineup မထွက်သေးပါ")
+            lines.append(f" * **လူစာရင်း (Lineups):** {home_name} — {h_lu_txt} | {away_name} — {a_lu_txt}။")
+        else:
+            lines.append(" * **လူစာရင်း (Lineups):** ပွဲမစမီ Starting XI စာရင်း မထွက်ရှိသေးပါ (သို့မဟုတ် Provider ဘက်မှ မပေးသေးပါ)။")
+    elif live_fetched:
+        lines.append(" * Live Football API ကို Fetch လုပ်ခဲ့သော်လည်း ဤပွဲအတွက် Lineup သို့မဟုတ် Injury ဒေတာ မတွေ့ရှိသေးပါ။")
+    else:
+        lines.append(" * Live Football API ကို Fetch မလုပ်ရသေးပါ။ ပွဲမတိုင်မီ Lineup နှင့် Injury စာရင်းများကို ကြည့်ရန် **Fetch Live Football API** ကို နှိပ်ပါ။")
+
+    lines.append("")
+    lines.append("*(မှတ်ချက် - ဤကိန်းဂဏန်းများသည် သင်္ချာမော်ဒယ် ခန့်မှန်းချက်များသာ ဖြစ်ပြီး ရာနှုန်းပြည့် သေချာမှု မဟုတ်ပါ။)*")
+    return "\n".join(lines)
+
+
+# -----------------------------
+# Add-on: prediction history, result sync, and conservative calibration
+# -----------------------------
+
+
+def _history_db_path() -> str:
+    """Allow deployment-specific persistent storage without changing model code."""
+    try:
+        configured = st.secrets.get("PREDICTION_HISTORY_DB", "")
+    except Exception:
+        configured = ""
+    return str(configured or HISTORY_DB_PATH)
+
+
+def _history_connect() -> sqlite3.Connection:
+    conn = sqlite3.connect(_history_db_path(), timeout=20)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute(""" CREATE TABLE IF NOT EXISTS prediction_history ( id INTEGER PRIMARY KEY AUTOINCREMENT, fixture_id TEXT NOT NULL, competition_code TEXT NOT NULL, league_name TEXT NOT NULL, home_team TEXT NOT NULL, away_team TEXT NOT NULL, kickoff_utc TEXT, predicted_at_utc TEXT NOT NULL, model_version TEXT NOT NULL, raw_probabilities_json TEXT NOT NULL, shown_probabilities_json TEXT NOT NULL, details_json TEXT NOT NULL, result_status TEXT NOT NULL DEFAULT 'PENDING', actual_home_goals INTEGER, actual_away_goals INTEGER, result_updated_at_utc TEXT, UNIQUE (competition_code, fixture_id, model_version) ) """)
+    conn.commit()
+    return conn
+
+
+def _json_default(value: Any) -> Any:
+    if isinstance(value, (datetime,)):
+        return value.isoformat()
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.floating,)):
+        return float(value)
+    if isinstance(value, (np.ndarray,)):
+        return value.tolist()
+    return str(value)
+
+
+def _history_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, default=_json_default, separators=(",", ":"))
+
+
+def save_prediction_history( *, match: Dict[str, Any], competition_code: str, league_name: str, model: Dict[str, Any], raw_probabilities: Dict[str, float], details: Dict[str, Any], ) -> bool:
+    """Insert/update one latest pre-match snapshot; never overwrite a finalized result."""
+    fixture_id = match.get("id")
+    if fixture_id is None:
+        return False
+    kickoff = parse_datetime(match.get("utcDate"))
+    if kickoff is None or kickoff <= utc_now():
+        return False
+    home = match.get("homeTeam", {}).get("name", "Home")
+    away = match.get("awayTeam", {}).get("name", "Away")
+    shown = model.get("probabilities", {})
+    now_iso = utc_now().isoformat()
+    conn = _history_connect()
+    try:
+        conn.execute(""" INSERT INTO prediction_history ( fixture_id, competition_code, league_name, home_team, away_team, kickoff_utc, predicted_at_utc, model_version, raw_probabilities_json, shown_probabilities_json, details_json ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (competition_code, fixture_id, model_version) DO UPDATE SET league_name=excluded.league_name, home_team=excluded.home_team, away_team=excluded.away_team, kickoff_utc=excluded.kickoff_utc, predicted_at_utc=excluded.predicted_at_utc, raw_probabilities_json=excluded.raw_probabilities_json, shown_probabilities_json=excluded.shown_probabilities_json, details_json=excluded.details_json WHERE prediction_history.result_status != 'FINISHED' """, (
+            str(fixture_id), competition_code, league_name, home, away,
+            kickoff.isoformat(), now_iso, MODEL_VERSION,
+            _history_json(raw_probabilities), _history_json(shown), _history_json(details),
+        ))
+        conn.commit()
+        return True
+    finally:
+        conn.close()
+
+
+def sync_history_results(finished_matches: List[Dict[str, Any]], competition_code: str) -> int:
+    """Attach verified FINISHED scores to already-saved fixtures."""
+    updates = []
+    now_iso = utc_now().isoformat()
+    for match in finished_matches:
+        if match.get("status") != "FINISHED" or match.get("id") is None:
+            continue
+        full_time = (match.get("score") or {}).get("fullTime") or {}
+        home_goals, away_goals = full_time.get("home"), full_time.get("away")
+        if home_goals is None or away_goals is None:
+            continue
+        updates.append((int(home_goals), int(away_goals), now_iso, competition_code, str(match["id"])))
+    if not updates:
+        return 0
+    conn = _history_connect()
+    try:
+        cur = conn.executemany(""" UPDATE prediction_history SET result_status='FINISHED', actual_home_goals=?, actual_away_goals=?, result_updated_at_utc=? WHERE competition_code=? AND fixture_id=? """, updates)
+        conn.commit()
+        return max(0, cur.rowcount)
+    finally:
+        conn.close()
+
+
+def _load_calibration_rows(competition_code: str, before_kickoff: Optional[datetime]) -> List[Dict[str, Any]]:
+    if before_kickoff is None:
+        return []
+    conn = _history_connect()
+    try:
+        rows = conn.execute(""" SELECT raw_probabilities_json, actual_home_goals, actual_away_goals FROM prediction_history WHERE competition_code=? AND result_status='FINISHED' AND kickoff_utc < ? AND actual_home_goals IS NOT NULL AND actual_away_goals IS NOT NULL ORDER BY kickoff_utc """, (competition_code, before_kickoff.isoformat())).fetchall()
+        out = []
+        for row in rows:
+            try:
+                probs = json.loads(row["raw_probabilities_json"])
+                out.append({
+                    "probabilities": probs,
+                    "home_goals": int(row["actual_home_goals"]),
+                    "away_goals": int(row["actual_away_goals"]),
+                })
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+        return out
+    finally:
+        conn.close()
+
+
+def _fit_temperature(rows: List[Dict[str, Any]], market: str) -> Tuple[float, int]:
+    """Fit a single low-complexity temperature using only prior finalized snapshots."""
+    usable = []
+    for row in rows:
+        p = row["probabilities"]
+        if market == "1x2":
+            keys = ("home_win", "draw", "away_win")
+            target = 0 if row["home_goals"] > row["away_goals"] else 2 if row["home_goals"] < row["away_goals"] else 1
+        else:
+            keys = ("over25", "under25")
+            target = 0 if row["home_goals"] + row["away_goals"] >= 3 else 1
+        try:
+            values = np.asarray([float(p[k]) for k in keys], dtype=float)
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not np.all(np.isfinite(values)) or np.any(values < 0) or values.sum() <= 0:
+            continue
+        values = np.clip(values / values.sum(), 1e-8, 1.0)
+        usable.append((values, target))
+    n = len(usable)
+    if n < HISTORY_CALIBRATION_MIN_SAMPLES:
+        return 1.0, n
+    best_t, best_loss = 1.0, float("inf")
+    for temperature in np.linspace(0.70, 1.50, 65):
+        losses = []
+        for values, target in usable:
+            adjusted = np.power(values, 1.0 / float(temperature))
+            adjusted /= adjusted.sum()
+            losses.append(-math.log(max(float(adjusted[target]), 1e-12)))
+        mean_loss = float(np.mean(losses))
+        if mean_loss < best_loss:
+            best_t, best_loss = float(temperature), mean_loss
+    return best_t, n
+
+
+def apply_history_calibration( model: Dict[str, Any], rows: List[Dict[str, Any]] ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Apply conservative past-data calibration without modifying predict_match()."""
+    adjusted = dict(model)
+    adjusted["probabilities"] = dict(model.get("probabilities", {}))
+    t_1x2, n_1x2 = _fit_temperature(rows, "1x2")
+    t_totals, n_totals = _fit_temperature(rows, "totals")
+    p = adjusted["probabilities"]
+    if n_1x2 >= HISTORY_CALIBRATION_MIN_SAMPLES:
+        keys = ("home_win", "draw", "away_win")
+        vals = np.asarray([max(float(p[k]), 1e-8) for k in keys]) ** (1.0 / t_1x2)
+        vals /= vals.sum()
+        for key, value in zip(keys, vals):
+            p[key] = float(value)
+    if n_totals >= HISTORY_CALIBRATION_MIN_SAMPLES:
+        keys = ("over25", "under25")
+        vals = np.asarray([max(float(p[k]), 1e-8) for k in keys]) ** (1.0 / t_totals)
+        vals /= vals.sum()
+        for key, value in zip(keys, vals):
+            p[key] = float(value)
+    info = {
+        "1x2_samples": n_1x2,
+        "totals_samples": n_totals,
+        "1x2_temperature": t_1x2,
+        "totals_temperature": t_totals,
+        "active": n_1x2 >= HISTORY_CALIBRATION_MIN_SAMPLES or n_totals >= HISTORY_CALIBRATION_MIN_SAMPLES,
+    }
+    return adjusted, info
+
+
+def _history_prediction_label(probabilities: Dict[str, Any]) -> str:
+    labels = {"home_win": "Home", "draw": "Draw", "away_win": "Away"}
+    key = max(labels, key=lambda k: float(probabilities.get(k, 0.0)))
+    return labels[key]
+
+
+def render_prediction_history(competition_code: str) -> None:
+    """Compact expandable history and scoring panel."""
+    with st.expander("📚 Prediction History & Auto Calibration", expanded=False):
+        try:
+            conn = _history_connect()
+            try:
+                rows = conn.execute(""" SELECT * FROM prediction_history WHERE competition_code=? ORDER BY kickoff_utc DESC LIMIT 500 """, (competition_code,)).fetchall()
+            finally:
+                conn.close()
+        except sqlite3.Error as exc:
+            st.error(f"Prediction history database error: {exc}")
+            return
+        records = [dict(row) for row in rows]
+        finished = [r for r in records if r["result_status"] == "FINISHED"]
+        if not records:
+            st.info("သိမ်းထားသော prediction မရှိသေးပါ။ Upcoming match တစ်ပွဲကို ရွေးလိုက်သောအခါ အလိုအလျောက်သိမ်းပါမည်။")
+            return
+        st.caption(f"Database: `{_history_db_path()}` · ဒီလိဂ်တွင် သိမ်းထားသော {len(records)} ပွဲ · Result ရရှိပြီး {len(finished)} ပွဲ")
+        if finished:
+            hits, brier_values = 0, []
+            for row in finished:
+                try:
+                    p = json.loads(row["shown_probabilities_json"])
+                    actual_h, actual_a = row["actual_home_goals"], row["actual_away_goals"]
+                    actual = "home_win" if actual_h > actual_a else "away_win" if actual_h < actual_a else "draw"
+                    hits += int(max(("home_win", "draw", "away_win"), key=lambda k: p.get(k, 0.0)) == actual)
+                    target = {"home_win": 1.0 if actual == "home_win" else 0.0,
+                              "draw": 1.0 if actual == "draw" else 0.0,
+                              "away_win": 1.0 if actual == "away_win" else 0.0}
+                    brier_values.append(sum((float(p.get(k, 0.0)) - target[k]) ** 2 for k in target))
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    continue
+            if brier_values:
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Finished predictions", len(brier_values))
+                c2.metric("1X2 hit rate", f"{hits / len(brier_values) * 100:.1f}%")
+                c3.metric("1X2 Brier score", f"{float(np.mean(brier_values)):.4f}", help="Lower is better; calculated from the probabilities shown at prediction time.")
+        display = []
+        export = []
+        for row in records:
+            try:
+                probs = json.loads(row["shown_probabilities_json"])
+            except (TypeError, ValueError, json.JSONDecodeError):
+                probs = {}
+            actual = "—"
+            if row["result_status"] == "FINISHED":
+                actual = f"{row['actual_home_goals']}-{row['actual_away_goals']}"
+            item = {
+                "Kickoff (UTC)": row["kickoff_utc"], "Home": row["home_team"], "Away": row["away_team"],
+                "Prediction": _history_prediction_label(probs), "H/D/A": " / ".join(f"{float(probs.get(k, 0))*100:.0f}%" for k in ("home_win", "draw", "away_win")),
+                "Actual score": actual, "Status": row["result_status"], "Model": row["model_version"],
+            }
+            display.append(item)
+            export.append({**item, "Probability JSON": row["shown_probabilities_json"], "Input snapshot JSON": row["details_json"]})
+        st.dataframe(pd.DataFrame(display), use_container_width=True, hide_index=True)
+        csv_data = pd.DataFrame(export).to_csv(index=False).encode("utf-8-sig")
+        st.download_button("Download prediction history CSV", csv_data,
+                           file_name=f"prediction_history_{competition_code}.csv", mime="text/csv")
+
+
+
+# -----------------------------
+# Streamlit UI
+# -----------------------------
+
+
+def main() -> None:
+    st.title("⚽ Football Prediction Dashboard V8.5")
+    st.caption(f"Model: `{MODEL_VERSION}` • Elo + Venue xG + Dixon-Coles + Odds Value Finder + Live Team News")
+
+    with st.sidebar:
+        st.header("🔑 API Keys")
+        fd_key = st.text_input("football-data.org API Key", value=safe_secret("FOOTBALL_DATA_API_KEY"), type="password")
+        odds_key = st.text_input("The Odds API Key", value=safe_secret("ODDS_API_KEY"), type="password")
+        lfa_key = st.text_input("Live Football API Key", value=safe_secret("LIVE_FOOTBALL_API_KEY"), type="password")
+
+        st.header("🏆 Competition & Window")
+        league_name = st.selectbox("League", list(LEAGUES.keys()), index=0)
+        days_ahead = st.slider("Upcoming window (days)", min_value=1, max_value=14, value=7)
+        days_back = st.slider("Historical lookback (days)", min_value=60, max_value=365, value=210)
+        odds_regions = st.text_input("Odds regions", value="uk,eu,us")
+
+        st.header("⚙️ Model & Adjustments")
+        attack_power = st.slider("Attacking power exponent", 0.40, 1.10, DEFAULT_ATTACK_POWER, 0.05)
+        odds_blend = st.slider("Blend with no-vig market prob", 0.0, 0.80, 0.0, 0.05)
+        home_tac = st.slider("Home tactical/motivation adj", -3.0, 3.0, 0.0, 0.5)
+        away_tac = st.slider("Away tactical/motivation adj", -3.0, 3.0, 0.0, 0.5)
+        inj_pen_h = st.slider("Home injury impact penalty", 0.0, 0.35, 0.0, 0.02)
+        inj_pen_a = st.slider("Away injury impact penalty", 0.0, 0.35, 0.0, 0.02)
+
+    league_cfg = LEAGUES[league_name]
+    comp_code = league_cfg["football_data"]
+    sport_key = league_cfg["odds"]
+    lfa_league_id = league_cfg["lfa_league"]
+
+    d_from, d_to, win_start, win_end = fixture_window(days_ahead)
+    hist_from, hist_to = finished_window(days_back)
+
+    fixtures_raw, fix_err = fetch_fixtures(comp_code, fd_key, d_from, d_to)
+    finished_raw, fin_err = fetch_finished_matches(comp_code, fd_key, hist_from, hist_to)
+    standings, std_err = fetch_standings(comp_code, fd_key)
+    sync_history_results(finished_raw, comp_code)
+
+    if fix_err:
+        st.error(f"Fixtures error: {fix_err}")
+    if fin_err:
+        st.warning(f"Finished matches warning: {fin_err}")
+    if std_err:
+        st.info(f"Standings info: {std_err}")
+
+    upcoming = upcoming_only(fixtures_raw, win_start, win_end)
+    if not upcoming:
+        st.info("Selected window တွင် SCHEDULED / TIMED ပွဲစဉ်များ မတွေ့ရှိပါ။")
+        render_prediction_history(comp_code)
+        return
+
+    fixture_labels: List[str] = []
+    fixture_map: Dict[str, Dict[str, Any]] = {}
+    for m in upcoming:
+        h_n = m.get("homeTeam", {}).get("name", "Home")
+        a_n = m.get("awayTeam", {}).get("name", "Away")
+        dt_str = local_datetime(m.get("utcDate"))
+        lbl = f"{h_n} vs {a_n} ({dt_str})"
+        fixture_labels.append(lbl)
+        fixture_map[lbl] = m
+
+    selected_label = st.selectbox("Select Match", fixture_labels)
+    match = fixture_map[selected_label]
+    home_name = match.get("homeTeam", {}).get("name", "Home")
+    away_name = match.get("awayTeam", {}).get("name", "Away")
+    kickoff_dt = parse_datetime(match.get("utcDate"))
+    kickoff_date_str = kickoff_dt.astimezone(LOCAL_TZ).strftime("%Y-%m-%d") if kickoff_dt else utc_now().date().isoformat()
+
+    odds_state_key = f"odds_fetched_{comp_code}"
+    live_state_key = f"live_fetched_{comp_code}_{normalize_team(home_name)}_{normalize_team(away_name)}_{kickoff_date_str}"
+
+    st.session_state.setdefault(odds_state_key, False)
+    st.session_state.setdefault(live_state_key, False)
+
+    col_btn1, col_btn2, col_btn3 = st.columns([1, 1, 2])
+    with col_btn1:
+        if st.button("💹 Fetch Odds API", use_container_width=True):
+            st.session_state[odds_state_key] = True
+    with col_btn2:
+        if st.button("🩺 Fetch Live Football API", use_container_width=True):
+            st.session_state[live_state_key] = True
+    with col_btn3:
+        st.caption(f"Kickoff: **{local_datetime(match.get('utcDate'))}** | Standings teams loaded: **{len(standings)}**")
+
+    odds_parsed: Dict[str, Any] = {
+        "h2h_best": {},
+        "h2h_market_probability": {},
+        "totals25_best": {},
+        "totals25_market_probability": {},
+        "bookmakers": 0,
+        "last_update": None,
+    }
+    odds_fetched = bool(st.session_state.get(odds_state_key))
+    if odds_fetched:
+        odds_events, odds_err, remaining_req = fetch_global_odds(sport_key, odds_key, odds_regions)
+        if odds_err:
+            st.warning(f"Odds API: {odds_err}")
+        else:
+            ev = match_odds_event(home_name, away_name, odds_events)
+            odds_parsed = parse_global_odds(ev, home_name, away_name)
+            if remaining_req is not None:
+                st.caption(f"Odds API requests remaining: `{remaining_req}` | Bookmakers: `{odds_parsed['bookmakers']}`")
+
+    live_fetched = bool(st.session_state.get(live_state_key))
+    team_news_raw: Dict[str, Any] = {
+        "injuries": {"home": [], "away": []},
+        "lineups": {},
+        "statistics": {},
+        "errors": [],
+    }
+    team_news_summary: Dict[str, Any] = {"has_data": False}
+    if live_fetched:
+        team_news_raw = fetch_live_football_team_news(
+            lfa_key,
+            lfa_league_id,
+            kickoff_date_str,
+            home_name,
+            away_name,
+        )
+        team_news_summary = summarize_team_news(team_news_raw, home_name, away_name)
+        for err_msg in team_news_raw.get("errors", []):
+            st.caption(f"Live Football API note: {err_msg}")
+
+    ratings_data = build_ratings_and_xg_stats(finished_raw, attack_power=attack_power)
+    model = predict_match(
+        home_name,
+        away_name,
+        kickoff_dt,
+        ratings_data,
+        home_tactical_adj=home_tac,
+        away_tactical_adj=away_tac,
+        odds_blend_weight=odds_blend,
+        odds_parsed=odds_parsed if odds_fetched else None,
+        injury_penalty_home=inj_pen_h,
+        injury_penalty_away=inj_pen_a,
+    )
+    raw_probabilities = dict(model["probabilities"])
+    calibration_rows = _load_calibration_rows(comp_code, kickoff_dt)
+    model, calibration_info = apply_history_calibration(model, calibration_rows)
+    history_details = {
+        "settings": {
+            "attack_power": attack_power,
+            "odds_blend_weight": odds_blend,
+            "home_tactical_adj": home_tac,
+            "away_tactical_adj": away_tac,
+            "injury_penalty_home": inj_pen_h,
+            "injury_penalty_away": inj_pen_a,
+            "home_elo_advantage": HOME_ELO_ADVANTAGE,
+            "dixon_coles_rho": DIXON_COLES_RHO,
+        },
+        "model_values": {k: model.get(k) for k in (
+            "home_elo", "away_elo", "lam_home", "lam_away", "expected_gd",
+            "expected_total_goals", "rest_days_h", "rest_days_a", "top_scores"
+        )},
+        "rating_snapshot": {
+            "league_home_avg": ratings_data.get("league_home_avg"),
+            "league_away_avg": ratings_data.get("league_away_avg"),
+            "home_recent_home_goals_for": ratings_data.get("home_gf", {}).get(normalize_team(home_name), []),
+            "home_recent_home_goals_against": ratings_data.get("home_ga", {}).get(normalize_team(home_name), []),
+            "away_recent_away_goals_for": ratings_data.get("away_gf", {}).get(normalize_team(away_name), []),
+            "away_recent_away_goals_against": ratings_data.get("away_ga", {}).get(normalize_team(away_name), []),
+        },
+        "odds": odds_parsed if odds_fetched else {},
+        "team_news_summary": team_news_summary,
+        "standings": {
+            "home": standings.get(normalize_team(home_name)),
+            "away": standings.get(normalize_team(away_name)),
+        },
+        "calibration": calibration_info,
+    }
+    try:
+        save_prediction_history(
+            match=match,
+            competition_code=comp_code,
+            league_name=league_name,
+            model=model,
+            raw_probabilities=raw_probabilities,
+            details=history_details,
+        )
+    except (sqlite3.Error, OSError) as exc:
+        st.warning(f"Prediction ကိုပြသထားသော်လည်း History auto-save မအောင်မြင်ပါ: {exc}")
+    if calibration_info["active"]:
+        st.caption(
+            "History calibration ဖွင့်ထားသည် — "
+            f"1X2 sample {calibration_info['1x2_samples']} (T={calibration_info['1x2_temperature']:.2f}), "
+            f"O/U sample {calibration_info['totals_samples']} (T={calibration_info['totals_temperature']:.2f}). "
+            "လက်ရှိပွဲ kickoff မတိုင်မီ အပြီးသတ်ခဲ့သော history ကိုသာ အသုံးပြုထားသည်။"
+        )
+    else:
+        st.caption(
+            f"History calibration ကို sample {HISTORY_CALIBRATION_MIN_SAMPLES} ပွဲစီ မပြည့်သေးသဖြင့် မသုံးရသေးပါ "
+            f"(1X2 {calibration_info['1x2_samples']} / O-U {calibration_info['totals_samples']})."
+        )
+
+    value_bets = build_value_bets(model, odds_parsed) if odds_fetched else []
+
+    p = model["probabilities"]
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric(f"{home_name} Win", f"{p['home_win']*100:.1f}%", f"Elo {model['home_elo']:.0f}")
+    m2.metric("Draw", f"{p['draw']*100:.1f}%")
+    m3.metric(f"{away_name} Win", f"{p['away_win']*100:.1f}%", f"Elo {model['away_elo']:.0f}")
+    m4.metric("Over 2.5 Goals", f"{p['over25']*100:.1f}%", f"xG {model['expected_total_goals']:.2f}")
+    m5.metric("Under 2.5 Goals", f"{p['under25']*100:.1f}%", f"Exp GD {model['expected_gd']:+.2f}")
+
+    analysis_md = build_detailed_burmese_analysis(
+        home_name=home_name,
+        away_name=away_name,
+        model=model,
+        odds_parsed=odds_parsed,
+        value_bets=value_bets,
+        team_news_summary=team_news_summary,
+        odds_fetched=odds_fetched,
+        live_fetched=live_fetched,
+    )
+    st.markdown(analysis_md)
+
+    st.divider()
+
+    c_left, c_right = st.columns(2)
+    with c_left:
+        st.subheader("🎯 Value Bet Finder")
+        if odds_fetched and value_bets:
+            df_vb = pd.DataFrame(value_bets).drop(columns=["key"])
+            for col in ("Model probability", "No-vig market probability", "Edge", "Expected value"):
+                df_vb[col] = df_vb[col].apply(lambda v: f"{v*100:+.1f}%" if pd.notna(v) else "—")
+            df_vb["Best odds"] = df_vb["Best odds"].apply(lambda v: f"{v:.2f}")
+            st.dataframe(df_vb, use_container_width=True, hide_index=True)
+        else:
+            st.info("Value Bet table ကြည့်ရန် **Fetch Odds API** ကို နှိပ်ပါ။")
+
+        st.subheader("🔢 Top Exact Scores (Dixon-Coles)")
+        df_scores = pd.DataFrame(
+            [{"Score": sc, "Probability": f"{pr*100:.1f}%"} for sc, pr in model["top_scores"]]
+        )
+        st.dataframe(df_scores, use_container_width=True, hide_index=True)
+
+    with c_right:
+        st.subheader("🩺 Lineups & Injury List")
+        if live_fetched and team_news_summary.get("has_data"):
+            st.markdown(f"**{home_name} Injuries:** {', '.join(team_news_summary['home_injuries']) or 'None'}")
+            st.markdown(f"**{away_name} Injuries:** {', '.join(team_news_summary['away_injuries']) or 'None'}")
+            st.markdown(
+                f"**{home_name} Lineup ({team_news_summary.get('home_formation') or '—'}):** "
+                f"{', '.join(team_news_summary['home_lineup']) or 'Not available'}"
+            )
+            st.markdown(
+                f"**{away_name} Lineup ({team_news_summary.get('away_formation') or '—'}):** "
+                f"{', '.join(team_news_summary['away_lineup']) or 'Not available'}"
+            )
+        else:
+            st.info("Lineup နှင့် Injury စာရင်း ကြည့်ရန် **Fetch Live Football API** ကို နှိပ်ပါ။")
+
+    render_prediction_history(comp_code)
+
+
+if __name__ == "__main__":
+    main()
+    main()
